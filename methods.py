@@ -41,7 +41,7 @@ def mixup_data(x, y, alpha=1.0, use_cuda=True):
 
 
 def mixup_criterion(criterion, pred, y_a, y_b, lam, pred_mixed, y_mixed, y, gamma=1.0, rho=0.0):
-    loss_mixup = lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b) # lamda * L(f(x'),y1) + (1-lamda)* L(f(x'),y2)
+    loss_mixup = lam * criterion(pred, y_a) + (1.0 - lam) * criterion(pred, y_b) # lamda * L(f(x'),y1) + (1-lamda)* L(f(x'),y2)
     y_mixed = y_mixed.type(torch.LongTensor).cuda()
     label_mixup = criterion(pred_mixed, y_mixed) # L(f(x'),y')
     sup = criterion(pred, y) # L(f(x), y)

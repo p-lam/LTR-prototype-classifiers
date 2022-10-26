@@ -357,8 +357,8 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
                 feat = block(feat_a.detach())
                 output = classifier(feat)
             else:
-                x = lam * x1 + (1 - lam) * x2 
-                y = lam * targets_a + (1 - lam) * targets_b 
+                x = lam * x1 + (1.0 - lam) * x2 
+                y = lam * targets_a + (1.0 - lam) * targets_b 
                 # convex condition
                 # f(x|y)
                 feat = model(images)
