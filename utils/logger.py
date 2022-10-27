@@ -60,7 +60,7 @@ def create_logger(cfg, cfg_name):
 
     cfg_name = os.path.basename(cfg_name).split('.')[0]
 
-    log_dir = Path("saved")  / (cfg_name + '_' + time_str) / Path(cfg.log_dir)
+    log_dir = Path("saved")  / (cfg.name) / Path(cfg.log_dir)
     print('=> creating {}'.format(log_dir))
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -75,8 +75,7 @@ def create_logger(cfg, cfg_name):
     console = logging.StreamHandler()
     logging.getLogger('').addHandler(console)
 
-    model_dir =  Path("saved") / (cfg_name + '_' + time_str) / Path(cfg.model_dir)
+    model_dir =  Path("saved") / (cfg.name) / Path(cfg.model_dir)
     print('=> creating {}'.format(model_dir))
     model_dir.mkdir(parents=True, exist_ok=True)
-
     return logger, str(model_dir)

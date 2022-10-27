@@ -367,7 +367,7 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
                 feat_mixed = model(x)
                 output_mixed = classifier(feat_mixed)
 
-            loss = mixup_criterion(criterion, output, targets_a, targets_b, lam, output_mixed, y, target, gamma=config.gamma, rho=config.rho)
+            loss = mixup_crit(criterion, output, targets_a, targets_b, lam, output_mixed, y, target, gamma=config.gamma, rho=config.rho)
         else:
             if config.dataset == 'places':
                 with torch.no_grad():
@@ -507,6 +507,14 @@ def adjust_learning_rate(optimizer, epoch, config):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
+def mixup_crit(criterion, pred, y_a, y_b, lam, pred_mixed, y_mixed, y, gamma=1.0, rho=0.0):
+    loss_mixup = lam * criterion(pred, y_a) + (1.0 - lam) * criterion(pred, y_b) # lamda * L(f(x'),y1) + (1-lamda)* L(f(x'),y2)
+    # y_mixed = y_mixed.type(torch.LongTensor).cuda()
+    # label_mixup = criterion(pred_mixed, y_mixed) # L(f(x'),y')
+    # sup = criterion(pred, y) # L(f(x), y)
+    # hinge  = max(0, (label_mixup - loss_mixup))
+    # correct term: return sup + mixup
+    return loss_mixup
 
 if __name__ == '__main__':
     main()
