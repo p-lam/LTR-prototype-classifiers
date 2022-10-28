@@ -358,6 +358,8 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
                 output = classifier(feat)
             else:
                 x = lam * x1 + (1.0 - lam) * x2 
+                targets_a = F.one_hot(targets_a, num_classes=config.num_classes)
+                targets_b = F.one_hot(targets_b, num_classes=config.num_classes)
                 y = lam * targets_a + (1.0 - lam) * targets_b 
                 # convex condition
                 # f(x|y)
@@ -366,8 +368,12 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
                 # f(tx1 + (1-t)x2)
                 feat_mixed = model(x)
                 output_mixed = classifier(feat_mixed)
+                # f(x1)
+                feat_x1 = model(x1)
+                output_x1 = classifier(feat_x1)
 
-            loss = mixup_criterion(criterion, output, targets_a, targets_b, lam, output_mixed, y, target, gamma=config.gamma, rho=config.rho)
+                output_x2 = classifier(model(x2))
+            loss = mixup_criterion(criterion, output, targets_a, targets_b, lam, output_mixed, y, target, output_x1, output_x2, gamma=config.gamma, rho=config.rho)
         else:
             if config.dataset == 'places':
                 with torch.no_grad():
