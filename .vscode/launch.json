@@ -11,7 +11,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "args": ["--cfg", "./config/cifar10/cifar10_imb001_stage1_mixup.yaml", "rho", "1.0", "gamma", "0.5", "name", "cifar10_imb001_rho_1_gamma_0.5_strong"]
+            "args": ["--cfg", "./config/cifar10/cifar10_imb001_stage1_mixup.yaml", "rho", "1.0", "gamma", "0.5", "name", "test"]
         }
     ]
 }

@@ -36,7 +36,7 @@ from utils import AverageMeter, ProgressMeter
 from utils import accuracy, calibration
 from lda import LDA
 
-from methods import mixup_data, mixup_criterion
+from methods import mixup_data, mixup_criterion, mixup_criterion2
 
 
 def parse_args():

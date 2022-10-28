@@ -239,7 +239,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
     with torch.no_grad():
         for i, (images, target) in enumerate(lda_loader):
             images = images.cuda()
-            mixed, targets_a, targets_b, lam, x1, x2 = mixup_data(images, target, alpha=config.alpha)
+            targets_a, targets_b, lam, x1, x2 = mixup_data(images, target, alpha=config.alpha)
             y = lam * targets_a + (1. - lam) * targets_b 
             feat = model(mixed.cuda()).cpu().numpy()
             features.append(feat)

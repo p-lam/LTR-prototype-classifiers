@@ -63,10 +63,28 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam, pred_mixed, y_mixed, y, x1, 
     # new term
     l2_dist = (y_mixed - y_b).pow(2).sum(dim=1).sqrt()
     dist = ((lam*(1.0-lam)*mu)/2) * l2_dist 
-    hinge = max(0, (label_mixup - loss_mixup + dist[0]))
+    hinge = max(torch.Tensor([0.0]).cuda().requires_grad_(True), (label_mixup - loss_mixup + dist[0]))
+
+    return label_mixup + gamma*hinge
+
+def mixup_criterion2(criterion, pred, y_a, y_b, lam, pred_mixed, y_mixed, y, x1, x2, gamma=0.9, rho=0.0, mu=0.5):
+    # lamda * L(f(x'),y1) + (1-lamda)* L(f(x'),y2)
+    y_a = y_a.type(torch.FloatTensor).cuda()
+    y_b = y_b.type(torch.FloatTensor).cuda()
+    y_mixed = y_mixed.type(torch.FloatTensor).cuda()
+    y1_mixup = criterion(pred_mixed, y_a)
+    y2_mixup = criterion(pred_mixed, y_b)
+    # L(f(x'),y')
+    label_mixup = criterion(pred_mixed, y_mixed)
+    # L(f(x), y)
+    sup = criterion(pred, y) 
+    # new term
+    l2_dist = (y_mixed - y_a).pow(2).sum(dim=1).sqrt()
+    dist = ((lam*(1.0-lam)*mu)/2) * l2_dist 
+
+    hinge = max(0, (label_mixup - y1_mixup + (mu/2)*dist[0]))
     return sup + gamma*hinge
-
-
+    
 # class LabelAwareSmoothing(nn.Module):
 #     def __init__(self, cls_num_list, smooth_head, smooth_tail, shape='concave', power=None):
 #         super(LabelAwareSmoothing, self).__init__()

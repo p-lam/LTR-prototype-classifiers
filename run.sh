@@ -1,4 +1,4 @@
-python3 train_stage1.py --cfg ./config/cifar10/cifar10_imb001_stage1_mixup.yaml rho 1. gamma 0.5 name cifar10_imb001_rho_1_gamma_0.5_strong
+python3 train_stage1.py --cfg ./config/cifar10/cifar10_imb001_stage1_mixup.yaml gamma 5. name cifar10_imb001_gamma5
 # python3 train_stage1.py --cfg ./config/cifar10/cifar10_imb001_stage1_mixup.yaml rho 100. gamma 1. name cifar10_imb001_rho_100_gamma_1
 # python3 train_stage1.py --cfg ./config/cifar10/cifar10_imb001_stage1_mixup.yaml rho 100. gamma 0.5 name cifar10_imb001_rho_100_gamma_0.5
 # python3 train_stage1_mislas.py --cfg ./config/cifar10/cifar10_imb001_stage1_mixup.yaml name mislas_regular
