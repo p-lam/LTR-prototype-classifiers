@@ -23,7 +23,6 @@ from datasets.imagenet import ImageNet_LT
 from datasets.ina2018 import iNa2018
 from lda import LDA
 
-from models import vgg
 from models import resnet
 from models import resnet_places
 from models import resnet_cifar
@@ -250,12 +249,12 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
 
     # fit lda on features
     # lda = LDA(n_classes=10, lamb=1e-3)
-    lda = LDA(n_classes=10, lamb=1e-3)
+    lda = LDA(n_classes=config.num_classes, lamb=1e-3)
     lda.forward(features, labels)
     # lda = None
     
     validate(val_loader, model, classifier, lws_model, criterion, config, logger, block, lda=lda)
-
+    
 
 def validate(val_loader, model, classifier, lws_model, criterion, config, logger, block=None, lda=None):
     batch_time = AverageMeter('Time', ':6.3f')

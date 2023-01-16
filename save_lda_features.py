@@ -35,7 +35,6 @@ from utils import config, update_config, create_logger
 from utils import AverageMeter, ProgressMeter
 from utils import accuracy, calibration
 from lda import LDA
-from vos import vos_sampling_step
 
 from methods import mixup_data, mixup_criterion
 
@@ -222,7 +221,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
         train_sampler = dataset.dist_sampler
 
     # define loss function (criterion) and optimizer
-    cls_dist = np.unique(train_loader.dataset.targets, return_counts=True)[1]
+    # cls_dist = np.unique(train_loader.dataset.targets, return_counts=True)[1]
     # criterion = lambda x, y: CB_loss(logits=x, labels=y, samples_per_cls=cls_dist, no_of_classes=10, loss_type="softmax", beta=0.9999, gamma=2.0)
     criterion = nn.CrossEntropyLoss().cuda(config.gpu)
 
@@ -302,38 +301,29 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
         [losses, top1],
         prefix="Epoch: [{}]".format(epoch))
 
-    # if epoch == 1: #fit lda once at beginning of training
-    #     model.eval()
-    #     classifier.eval()
-    #     lda_loader = dataset.lda
-    #     model.eval()
-    #     features = []
-    #     labels = []
-    #     with torch.no_grad():
-    #         for i, (images, target) in enumerate(lda_loader):
-    #             images = images.cuda()
-    #             feat = model(images).cpu().numpy()
-    #             features.append(feat)
-    #             labels.append(target.numpy())
-    #     features = np.concatenate(features, axis=0)
-    #     labels = np.concatenate(labels, axis=0)
+    model.eval()
+    classifier.eval()
+    lda_loader = dataset.lda
+    model.eval()
+    features = []
+    labels = []
+    with torch.no_grad():
+        for i, (images, target) in enumerate(lda_loader):
+            images = images.cuda()
+            feat = model(images).cpu().numpy()
+            features.append(feat)
+            labels.append(target.numpy())
+    features = np.concatenate(features, axis=0)
+    labels = np.concatenate(labels, axis=0)
 
-    #     features = torch.from_numpy(features).cuda()
-    #     labels = torch.from_numpy(labels).cuda()
+    features = torch.from_numpy(features).cuda()
+    labels = torch.from_numpy(labels).cuda()
 
-    #     # fit lda on features
-    #     lda = LDA(n_classes=config.num_classes, lamb=1e-3)
-    #     lda.forward(features, labels)
-    #     classifier.fc.weight.data = lda.coef_.cuda().float()
-    #     classifier.fc.bias.data = lda.intercept_.cuda().float()
-
-    # switch to train mode
-    if config.dataset == 'places':
-        model.eval()
-        block.train()
-    else:
-        model.train()
-    classifier.train()
+    # fit lda on features
+    lda = LDA(n_classes=config.num_classes, lamb=1e-3)
+    lda.forward(features, labels)
+    classifier.fc.weight.data = lda.coef_.cuda().float()
+    classifier.fc.bias.data = lda.intercept_.cuda().float()
 
     training_data_num = len(train_loader.dataset)
     end_steps = int(training_data_num / train_loader.batch_size)
@@ -399,128 +389,6 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
         if i % config.print_freq == 0:
             progress.display(i, logger)
 
-
-def validate(val_loader, model, classifier, criterion, config, logger, block=None):
-    # batch_time = AverageMeter('Time', ':6.3f')
-    losses = AverageMeter('Loss', ':.3f')
-    top1 = AverageMeter('Acc@1', ':6.3f')
-    # top5 = AverageMeter('Acc@5', ':6.3f')
-    progress = ProgressMeter(
-        len(val_loader),
-        [losses, top1],
-        prefix='Eval: ')
-
-    # switch to evaluate mode
-    model.eval()
-    if config.dataset == 'places':
-        block.eval()
-    classifier.eval()
-    class_num = torch.zeros(config.num_classes).cuda()
-    correct = torch.zeros(config.num_classes).cuda()
-
-    confidence = np.array([])
-    pred_class = np.array([])
-    true_class = np.array([])
-    total_loss, total_num = 0.0, 0
-
-    with torch.no_grad():
-        end = time.time()
-        for i, (images, target) in enumerate(val_loader):
-            if config.gpu is not None:
-                images = images.cuda(config.gpu, non_blocking=True)
-            if torch.cuda.is_available():
-                target = target.cuda(config.gpu, non_blocking=True)
-
-            # compute output
-            feat = model(images)
-            if config.dataset == 'places':
-                feat = block(feat)
-            output = classifier(feat)
-            loss = criterion(output, target)
-
-            total_num += val_loader.batch_size 
-            total_loss += loss.item() * val_loader.batch_size 
-
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images.size(0))
-            top1.update(acc1[0], images.size(0))
-            # top5.update(acc5[0], images.size(0))
-
-            _, predicted = output.max(1)
-            target_one_hot = F.one_hot(target, config.num_classes)
-            predict_one_hot = F.one_hot(predicted, config.num_classes)
-            class_num = class_num + target_one_hot.sum(dim=0).to(torch.float)
-            correct = correct + (target_one_hot + predict_one_hot == 2).sum(dim=0).to(torch.float)
-
-            prob = torch.softmax(output, dim=1)
-            confidence_part, pred_class_part = torch.max(prob, dim=1)
-            confidence = np.append(confidence, confidence_part.cpu().numpy())
-            pred_class = np.append(pred_class, pred_class_part.cpu().numpy())
-            true_class = np.append(true_class, target.cpu().numpy())
-
-            # measure elapsed time
-            # batch_time.update(time.time() - end)
-            # end = time.time()
-
-            if i % config.print_freq == 0:
-                progress.display(i, logger)
-
-        acc_classes = correct / class_num
-        head_acc = acc_classes[config.head_class_idx[0]:config.head_class_idx[1]].mean() * 100
-
-        med_acc = acc_classes[config.med_class_idx[0]:config.med_class_idx[1]].mean() * 100
-        tail_acc = acc_classes[config.tail_class_idx[0]:config.tail_class_idx[1]].mean() * 100
-        logger.info('* Acc@1 {top1.avg:.3f}% HAcc {head_acc:.3f}% MAcc {med_acc:.3f}% TAcc {tail_acc:.3f}%.'.format(top1=top1, head_acc=head_acc, med_acc=med_acc, tail_acc=tail_acc))
-
-        cal = calibration(true_class, pred_class, confidence, num_bins=15)
-        logger.info('* ECE   {ece:.3f}%.'.format(ece=cal['expected_calibration_error'] * 100))
-
-        ret_loss = total_loss / total_num
-    return top1.avg, cal['expected_calibration_error'] * 100, ret_loss
-
-
-def save_checkpoint(state, is_best, model_dir):
-    filename = model_dir + '/current.pth.tar'
-    torch.save(state, filename)
-    if is_best:
-        shutil.copyfile(filename, model_dir + '/model_best.pth.tar')
-
-
-def adjust_learning_rate(optimizer, epoch, config):
-    """Sets the learning rate"""
-    if config.cos:
-        lr_min = 0
-        lr_max = config.lr
-        lr = lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(epoch / config.num_epochs * 3.1415926535))
-    else:
-        epoch = epoch + 1
-        if epoch <= 5:
-            lr = config.lr * epoch / 5
-        elif epoch > 180:
-            lr = config.lr * 0.01
-        elif epoch > 160:
-            lr = config.lr * 0.1
-        else:
-            lr = config.lr
-
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-def mixup_process(out, target_reweighted, lam):
-    # target_reweighted is one-hot vector
-    # target is the taerget class.
-
-    # shuffle indices of mini-batch
-    indices = np.random.permutation(out.size(0))
-
-    out = out*lam.expand_as(out) + out[indices]*(1-lam.expand_as(out))
-    target_shuffled_onehot = target_reweighted[indices]
-    target_reweighted = target_reweighted * lam.expand_as(target_reweighted) + target_shuffled_onehot * (1 - lam.expand_as(target_reweighted))
-    return out, target_reweighted
-
-def to_one_hot(target, num_classes):
-    return F.one_hot(target, num_classes)
 
 if __name__ == '__main__':
     main()
