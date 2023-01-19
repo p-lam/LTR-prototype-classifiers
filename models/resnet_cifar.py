@@ -25,7 +25,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
+import random
 from torch.nn import Parameter
+from methods import mixup_data 
+import torchvision.models as torchmodels
 
 __all__ = ['ResNet_s', 'resnet20', 'resnet32', 'resnet44', 'resnet56', 'resnet110', 'resnet1202']
 
@@ -126,7 +129,7 @@ class ResNet_s(nn.Module):
 
 class ResNet_fe(nn.Module):
 
-    def __init__(self, block, num_blocks):
+    def __init__(self, block, num_blocks, pretrained=False):
         super(ResNet_fe, self).__init__()
         self.in_planes = 16
 
@@ -162,6 +165,79 @@ class ResNet_fe(nn.Module):
         out = out.view(out.size(0), -1)
         return out
 
+
+class ResNet_MM_fe(nn.Module):
+
+    def __init__(self, block, num_blocks):
+        super(ResNet_MM_fe, self).__init__()
+        self.in_planes = 16
+
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+        # self.bnneck = nn.BatchNorm2d(64)
+        # # zero bias 
+        # with torch.no_grad():
+        #     self.bnneck.bias.fill_(0.)
+        # self.bnneck.bias.requires_grad = False 
+
+        self.apply(_weights_init)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x, target, mixup_hidden=True, alpha=1.0, layer_mix=None):
+        if mixup_hidden == True:
+            if layer_mix == None:
+                layer_mix = random.randint(0,2)
+
+        out = x
+        
+        if layer_mix == 0:
+            out, y_a, y_b, lam = mixup_data(out, target, alpha)
+        
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+
+        if layer_mix == 1:
+            out, y_a, y_b, lam = mixup_data(out, target, alpha)
+        
+        out = self.layer2(out)
+
+        if layer_mix == 2:
+            #out = lam * out + (1 - lam) * out[index,:]
+            out, y_a, y_b, lam = mixup_data(out, target, alpha)
+        #print (out)
+
+        out = self.layer3(out)
+        
+        if layer_mix == 3:
+            #out = lam * out + (1 - lam) * out[index,:]
+            out, y_a, y_b, lam = mixup_data(out, target, alpha)
+        #print (out)
+     
+        out = F.avg_pool2d(out, out.size()[3])
+        # out = self.bnneck(out)
+        out = out.view(out.size(0), -1)
+
+        if layer_mix == 4:
+        #out = lam * out + (1 - lam) * out[index,:]
+            out, y_a, y_b, lam = mixup_data(out, target, alpha)
+        
+        if target is None:
+            return out 
+        else:
+            return out, y_a, y_b, lam
+
+
 class Classifier(nn.Module):
     def __init__(self, feat_in, num_classes):
         super(Classifier, self).__init__()
@@ -178,6 +254,9 @@ def resnet20():
 
 def resnet32_fe():
     return ResNet_fe(BasicBlock, [5, 5, 5])
+
+def resnet32_mm_fe():
+    return ResNet_MM_fe(BasicBlock, [5, 5, 5])
 
 def resnet32(num_classes=10, use_norm=False):
     return ResNet_s(BasicBlock, [5, 5, 5], num_classes=num_classes, use_norm=use_norm)

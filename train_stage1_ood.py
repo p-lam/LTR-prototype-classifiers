@@ -19,7 +19,7 @@ import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
 import torch.nn.functional as F
-from modules.cb_loss import CB_loss
+from torch.distributions import Categorical 
 
 from datasets.cifar10 import CIFAR10_LT
 from datasets.cifar100 import CIFAR100_LT
@@ -234,21 +234,6 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
     if config.distributed:
         train_sampler = dataset.dist_sampler
 
-    ## uncomment for gmm
-    # head_features, head_labels = [], []
-    # with torch.no_grad():
-    #     for i, (images, target) in enumerate(train_loader):
-    #         images = images.cuda()
-    #         feat = model(images).cpu().numpy()
-    #         for j in range(target.shape[0]):
-    #             if target[j] in [k for k in range(config.tail_class_idx[0], config.tail_class_idx[1])]:
-    #                 head_features.append(feat[j])
-    #                 head_labels.append(target.numpy())
-    # head_features = np.concatenate(head_features, axis=0)
-    # head_labels = np.concatenate(head_labels, axis=0)
-    # grid_search = GridSearchCV(GaussianMixture(), param_grid=param_grid, scoring=gmm_bic_score)
-    # grid_search.fit(head_features)
-
     cls_dist = np.unique(train_loader.dataset.targets, return_counts=True)[1]
     # criterion = lambda x, y: CB_loss(logits=x, labels=y, samples_per_cls=cls_dist, no_of_classes=10, loss_type="softmax", beta=0.9999, gamma=2.0)
     criterion = nn.CrossEntropyLoss().cuda(config.gpu)
@@ -265,6 +250,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
                                     weight_decay=config.weight_decay)
 
     results = {'train_loss':[], 'val_loss@1':[], 'test_acc@1':[]}
+    data_dict = torch.zeros(config.num_classes, config.sample_number, 342).cuda()
     train_losses, val_losses = [], []
     for epoch in range(config.num_epochs):
         if config.distributed:
@@ -317,7 +303,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
                 }, is_best, model_dir)
 
 
-def train(train_loader, model, classifier, criterion, optimizer, epoch, config, logger, dataset, block=None):
+def train(train_loader, model, classifier, criterion, optimizer, epoch, config, logger, dataset, data_dict, block=None):
     # batch_time = AverageMeter('Time', ':6.3f')
     # data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.3f')
@@ -328,31 +314,6 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
         len(train_loader),
         [losses, top1],
         prefix="Epoch: [{}]".format(epoch))
-
-    # if epoch == 1: #fit lda once at beginning of training
-    #     model.eval()
-    #     classifier.eval()
-    #     lda_loader = dataset.lda
-    #     model.eval()
-    #     features = []
-    #     labels = []
-    #     with torch.no_grad():
-    #         for i, (images, target) in enumerate(lda_loader):
-    #             images = images.cuda()
-    #             feat = model(images).cpu().numpy()
-    #             features.append(feat)
-    #             labels.append(target.numpy())
-    #     features = np.concatenate(features, axis=0)
-    #     labels = np.concatenate(labels, axis=0)
-
-    #     features = torch.from_numpy(features).cuda()
-    #     labels = torch.from_numpy(labels).cuda()
-
-    #     # fit lda on features
-    #     lda = LDA(n_classes=config.num_classes, lamb=1e-3)
-    #     lda.forward(features, labels)
-    #     classifier.fc.weight.data = lda.coef_.cuda().float()
-    #     classifier.fc.bias.data = lda.intercept_.cuda().float()
 
     # switch to train mode
     if config.dataset == 'places':
@@ -369,30 +330,45 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
     for i, (images, target) in enumerate(train_loader):
         if i > end_steps:
             break
-
-        # measure data loading time
-        # data_time.update(time.time() - end)
 # 
         if torch.cuda.is_available():
             images = images.cuda(config.gpu, non_blocking=True)
             target = target.cuda(config.gpu, non_blocking=True)
         
-        # # we apply extra strong augmentation to tail classes
-        # randaug = transforms.Compose([transforms.RandAugment(num_ops=3), # transforms.AugMix(severity=6)
-        #             transforms.ToTensor()])
-        # ## mid classes
-        # # randaug2 = transforms.Compose([transforms.AugMix(severity=3, mixture_width=2),
-        # #             transforms.ToTensor()])       
-        # for j in range(target.shape[0]):
-        #     if target[j] in [k for k in range(config.tail_class_idx[0], config.tail_class_idx[1])]:
-        #         pil = transforms.ToPILImage()
-        #         im = pil(images[j])
-        #         images[j] = randaug(im)
-        #     # elif target[j] in [k for k in range(config.med_class_idx[0], config.med_class_idx[1])]:
-        #     #     pil = transforms.ToPILImage()
-        #     #     im = pil(images[j])
-        #     #     images[j] = randaug2(im)
-        
+        # ID data queue 
+        if epoch < 0:
+            target_np = target.cpu().data.numpy()
+            for idx in range(len(target)):
+                dict_key = target_np[idx]
+                data_dict[dict_key] = torch.cat((data_dict[dict_key][1:], output[idx].detach().view(1,-1)), 0)
+
+        else:
+            # the covariance finder needs the data to be centered.
+            for index in range(config.num_classes):
+                if index == 0:
+                    X = data_dict[index] - data_dict[index].mean(0)
+                    mean_embed_id = data_dict[index].mean(0).view(1, -1)
+                else:
+                    X = torch.cat((X, data_dict[index] - data_dict[index].mean(0)), 0)
+                    mean_embed_id = torch.cat((mean_embed_id,
+                                               data_dict[index].mean(0).view(1, -1)), 0)
+
+            # add the variance.
+            eye_matrix = torch.eye(342, device='cuda')
+            temp_precision = torch.mm(X.t(), X) / len(X)
+            temp_precision += 0.0001 * eye_matrix
+
+            for index in range(config.num_classes):
+                new_dis = torch.distributions.multivariate_normal.MultivariateNormal(
+                    mean_embed_id[index], covariance_matrix=temp_precision)
+                negative_samples = new_dis.rsample((args.sample_from,))
+                prob_density = new_dis.log_prob(negative_samples)
+                cur_samples, index_prob = torch.topk(- prob_density, args.select)
+                if index == 0:
+                    ood_samples = negative_samples[index_prob]
+                else:
+                    ood_samples = torch.cat((ood_samples, negative_samples[index_prob]), 0)
+
         if config.mixup is True:
             images, targets_a, targets_b, lam = mixup_data(images, target, alpha=config.alpha)
             if config.dataset == 'places':
@@ -553,6 +529,7 @@ def adjust_learning_rate(optimizer, epoch, config):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
+
 def mixup_process(out, target_reweighted, lam):
     # target_reweighted is one-hot vector
     # target is the taerget class.
@@ -565,8 +542,37 @@ def mixup_process(out, target_reweighted, lam):
     target_reweighted = target_reweighted * lam.expand_as(target_reweighted) + target_shuffled_onehot * (1 - lam.expand_as(target_reweighted))
     return out, target_reweighted
 
+
 def to_one_hot(target, num_classes):
     return F.one_hot(target, num_classes)
+
+
+def train_batch_with_out(model, batch_idx, in_set, out_set, epoch, cls_num_list, config, criterion):
+    cls_rate = np.array(cls_num_list) / np.array(cls_num_list).sum()
+    if config.tau > 0:
+        rebalance_rate = torch.from_numpy(config.tau - cls_rate).cuda()
+    else:
+        rebalance_rate = torch.from_numpy(cls_rate.max() + cls_rate.min() - cls_rate).cuda()
+
+    data = torch.cat((in_set[0], out_set[0]), 0)
+    target = in_set[1]
+    data, target = data.cuda(), target.cuda() 
+    output = model(data)
+
+    probs = rebalance_rate.reshape(1,-1).repeat(out_set[0].shape[0], 1)
+    dist = Categorical(probs)
+    target_random = dist.sample().reshape(out_set[0].shape[0])
+
+    weight = rebalance_rate / rebalance_rate.sum() * config.num_classes
+
+    ce = F.cross_entropy()
+    loss = criterion(output[:in_set[0].shape[0]], target) + config.lambda_o * ce(
+        output[in_set[0].shape[0]:], target_random, weight=weight.float())
+
+    # measure accuracy and record loss
+    acc1, acc5 = accuracy(output[:len(in_set[0])], target, topk=(1, 5))
+
+    return loss, acc1, acc5
 
 if __name__ == '__main__':
     main()

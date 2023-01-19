@@ -306,4 +306,4 @@ class LDA(nn.Module):
         return log_proba
     
     def logit(self, X):
-        return X.matmul(self.coef_.t().cuda()) + self.intercept_.cuda()
+        return X.matmul(self.coef_.t().cuda()) + self.intercept_

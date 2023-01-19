@@ -1,10 +1,12 @@
 import argparse
 import os
 import random
-import time
 import warnings
 import numpy as np
 import pprint
+import pandas as pd 
+import torchvision.transforms as transforms 
+import matplotlib.pyplot as plt 
 
 import torch
 import torch.nn as nn
@@ -15,27 +17,33 @@ import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
 import torch.nn.functional as F
-
+from modules.cb_loss import CB_loss
+from sklearn.manifold import TSNE
 from datasets.cifar10 import CIFAR10_LT
 from datasets.cifar100 import CIFAR100_LT
 from datasets.places import Places_LT
 from datasets.imagenet import ImageNet_LT
 from datasets.ina2018 import iNa2018
-from lda import LDA
 
 from models import resnet
 from models import resnet_places
 from models import resnet_cifar
+from models import vgg 
 
 from utils import config, update_config, create_logger
 from utils import AverageMeter, ProgressMeter
 from utils import accuracy, calibration
+from lda import LDA
 from vos import vos_sampling_step
-from methods import LearnableWeightScaling
+
+from methods import mixup_data, mixup_criterion
+from sklearn.mixture import GaussianMixture 
+from sklearn.model_selection import GridSearchCV
+from sklearn.decomposition import PCA
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='MiSLAS evaluation')
+    parser = argparse.ArgumentParser(description='MiSLAS training (Stage-1)')
     parser.add_argument('--cfg',
                         help='experiment configure file name',
                         required=True,
@@ -44,7 +52,6 @@ def parse_args():
                         help="Modify config options using the command-line",
                         default=None,
                         nargs=argparse.REMAINDER)
-
     args = parser.parse_args()
     update_config(config, args)
 
@@ -52,7 +59,8 @@ def parse_args():
 
 
 best_acc1 = 0
-
+its_ece = 100
+t = 0.5
 
 def main():
     args = parse_args()
@@ -94,7 +102,7 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
-    global best_acc1
+    global best_acc1, its_ece
     config.gpu = gpu
 #     start_time = time.strftime("%Y%m%d_%H%M%S", time.localtime())
 
@@ -113,9 +121,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
 
     if config.dataset == 'cifar10' or config.dataset == 'cifar100':
         model = getattr(resnet_cifar, config.backbone)()
-        # model = getattr(vgg, config.backbone)()
         classifier = getattr(resnet_cifar, 'Classifier')(feat_in=64, num_classes=config.num_classes)
-        # classifier = getattr(vgg, 'Classifier')(feat_in=512, num_classes=config.num_classes)
 
     elif config.dataset == 'imagenet' or config.dataset == 'ina2018':
         model = getattr(resnet, config.backbone)()
@@ -124,11 +130,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
     elif config.dataset == 'places':
         model = getattr(resnet_places, config.backbone)(pretrained=True)
         classifier = getattr(resnet_places, 'Classifier')(feat_in=2048, num_classes=config.num_classes)
-        block = getattr(resnet_places, 'Bottleneck')(2048, 512, groups=1,
-                                                     base_width=64, dilation=1,
-                                                     norm_layer=nn.BatchNorm2d)
-
-    lws_model = LearnableWeightScaling(num_classes=config.num_classes)
+        block = getattr(resnet_places, 'Bottleneck')(2048, 512, groups=1, base_width=64, dilation=1, norm_layer=nn.BatchNorm2d)
 
     if not torch.cuda.is_available():
         logger.info('using CPU, this will be slow')
@@ -140,7 +142,6 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
             torch.cuda.set_device(config.gpu)
             model.cuda(config.gpu)
             classifier.cuda(config.gpu)
-            lws_model.cuda(config.gpu)
             # When using a single GPU per process and per
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
@@ -148,24 +149,19 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
             config.workers = int((config.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.gpu])
             classifier = torch.nn.parallel.DistributedDataParallel(classifier, device_ids=[config.gpu])
-            lws_model = torch.nn.parallel.DistributedDataParallel(lws_model, device_ids=[config.gpu])
-
             if config.dataset == 'places':
                 block.cuda(config.gpu)
                 block = torch.nn.parallel.DistributedDataParallel(block, device_ids=[config.gpu])
         else:
             model.cuda()
             classifier.cuda()
-            lws_model.cuda()
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             model = torch.nn.parallel.DistributedDataParallel(model)
             classifier = torch.nn.parallel.DistributedDataParallel(classifier)
-            lws_model = torch.nn.parallel.DistributedDataParallel(lws_model)
             if config.dataset == 'places':
                 block.cuda()
                 block = torch.nn.parallel.DistributedDataParallel(block)
-
     elif config.gpu is not None:
         torch.cuda.set_device(config.gpu)
         model = model.cuda(config.gpu)
@@ -176,7 +172,6 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
         # DataParallel will divide and allocate batch_size to all available GPUs
         model = torch.nn.DataParallel(model).cuda()
         classifier = torch.nn.DataParallel(classifier).cuda()
-        lws_model = torch.nn.DataParallel(lws_model).cuda()
         if config.dataset == 'places':
             block = torch.nn.DataParallel(block).cuda()
 
@@ -190,15 +185,13 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
                 # Map model to be loaded to specified single gpu.
                 loc = 'cuda:{}'.format(config.gpu)
                 checkpoint = torch.load(config.resume, map_location=loc)
+            # config.start_epoch = checkpoint['epoch']
+            best_acc1 = checkpoint['best_acc1']
             if config.gpu is not None:
                 # best_acc1 may be from a checkpoint from a different GPU
-                best_acc1 = best_acc1
+                best_acc1 = best_acc1.to(config.gpu)
             model.load_state_dict(checkpoint['state_dict_model'])
             classifier.load_state_dict(checkpoint['state_dict_classifier'])
-            if config.dataset == 'places':
-                block.load_state_dict(checkpoint['state_dict_block'])
-            if config.mode == 'stage2':
-                lws_model.load_state_dict(checkpoint['state_dict_lws_model'])
             logger.info("=> loaded checkpoint '{}' (epoch {})"
                         .format(config.resume, checkpoint['epoch']))
         else:
@@ -225,141 +218,94 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
         dataset = iNa2018(config.distributed, root=config.data_path,
                           batch_size=config.batch_size, num_works=config.workers)
 
-    val_loader = dataset.eval
-    criterion = nn.CrossEntropyLoss().cuda(config.gpu)
-
-    if config.dataset != 'places':
-        block = None
-
-    lda_loader = dataset.lda
-    model.eval()
-    features = []
-    labels = []
-    cls_dist = np.unique(lda_loader.dataset.targets, return_counts=True)[1]
+    train_loader = dataset.train_instance
+    imgs, labels = [], []
     with torch.no_grad():
-        for i, (images, target) in enumerate(lda_loader):
+        for i, (images, target) in enumerate(train_loader):
             images = images.cuda()
-            feat = model(images).cpu().numpy()
-            features.append(feat)
+            feats = model(images)
+            # feats = images
+            # feats = classifier(feats)
+            imgs.append(feats.detach().cpu().numpy())
             labels.append(target.numpy())
-    features = np.concatenate(features, axis=0)
+    images = np.concatenate(imgs, axis=0)
     labels = np.concatenate(labels, axis=0)
 
-    features = torch.from_numpy(features).cuda()
-    labels = torch.from_numpy(labels).cuda()
+    # filtered = [] 
+    # cnt1, cnt2, cnt3 = 0, 0, 0 
+    # for i, j in zip(images, labels):
+    #     if j == 3:
+    #         if cnt1 <= 100:
+    #             filtered.append((i,j))
+    #             cnt1 += 1 
+    #     if j == 2:
+    #         if cnt2 <= 100:
+    #             filtered.append((i,j))
+    #             cnt2 += 1
+    #     if j == 7: 
+    #         if cnt3 <= 100:
+    #             filtered.append((i,j))
+    #             cnt3 += 1 
+    #     else:
+    #         pass
 
-    N_SAMPLES_PER_CLASS = [cls_dist[0] - cls_dist[i] for i in range(config.num_classes)]
+    filtered = [(i,j) for i,j in zip(images, labels) if j == 3 or j == 2 or j == 7]
+    images, labels = zip(*filtered)
+    images = np.array(list(images))
+    labels = np.array(list(labels))
 
-    # try out method, sampling lowest likelihood parts of each ccg
-    resampled_data = vos_sampling_step(features.detach().cpu().numpy(), labels.detach().cpu().numpy(), N_SAMPLES_PER_CLASS, likelihood="lowest")
-    resampled_data = torch.cat(resampled_data, axis=0) # flatten from (num_classes, N_c, 64) to (N, 64)
-    print(resampled_data.shape)
-    resampled_labels = torch.from_numpy(np.concatenate([[i] * N_SAMPLES_PER_CLASS[i] for i in range(config.num_classes)])).cuda()
-    print(resampled_labels.shape)
-    # fit lda on features
-    
-    # combine resampled and original data
-    all_features = torch.cat([features, resampled_data], dim=0)
+    print(images.shape) # x_train
+    print(labels.shape) # y_train 
+    print(np.unique(labels, return_counts=True))
 
-    ## uncomment for manifold mixup 
-    # lam = np.random.beta(1.0,1.0)
-    # batch_size = all_features.size()[0]
-    # index = torch.randperm(batch_size).cuda()
-    # all_features = lam * all_features + (1. - lam) * all_features[index, :]
+    # pca = PCA(n_components=10)
+    # pca.fit(images.reshape((len(images), 32*32*3)))
+    # pca.fit(images)
+    # plt.figure(figsize=(8,8))
+    # plt.scatter(x=pca.transform(images.reshape((len(images), 32*32*3)))[:,0],
+    #             y=pca.transform(images.reshape((len(images), 32*32*3)))[:,1],
+    #             c=labels.reshape(len(images)))
+    # plt.scatter(x=pca.transform(images)[:,0],
+    #             y=pca.transform(images)[:,1],
+    #             c=labels.reshape(len(images)))
+    # plt.title("PCA on raw values")
+    # plt.colorbar()
+    # plt.plot()
+    # plt.show()
 
-    all_labels = torch.cat([labels, resampled_labels])
-    lda = LDA(n_classes=config.num_classes, lamb=1e-3)
-    lda.forward(all_features, all_labels)
-    # lda.forward(features, labels)
+    x_train = images
+    tsne_model = TSNE(n_components=2, random_state=0)
+    # tsne = tsne_model.fit_transform(x_train.reshape((len(x_train),32*32*3)))
+    tsne = tsne_model.fit_transform(x_train)
+    x_tsne = tsne[:,0]
+    y_tsne = tsne[:,1]
+    # x_tsne = scale_to_01_range(x_tsne)
+    # y_tsne = scale_to_01_range(y_tsne) 
 
-    # lda = None
-    
-    validate(val_loader, model, classifier, lws_model, criterion, config, logger, block, lda=lda)
-    
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
 
-def validate(val_loader, model, classifier, lws_model, criterion, config, logger, block=None, lda=None):
-    batch_time = AverageMeter('Time', ':6.3f')
-    losses = AverageMeter('Loss', ':.3f')
-    top1 = AverageMeter('Acc@1', ':6.3f')
-    top5 = AverageMeter('Acc@5', ':6.3f')
-    progress = ProgressMeter(
-        len(val_loader),
-        [batch_time, losses, top1, top5],
-        prefix='Eval: ')
+    for label in np.unique(labels): 
+        if label in [2, 3, 7]:
+            indices = [i for i, l in enumerate(labels) if l == label]
+            current_tx = np.take(x_tsne, indices)
+            current_ty = np.take(y_tsne, indices)
+            ax.scatter(current_tx, current_ty, label=label)
+    ax.legend(loc='best')
+    plt.show() 
 
-    # switch to evaluate mode
-    model.eval()
-    if config.dataset == 'places':
-        block.eval()
-    classifier.eval()
-    class_num = torch.zeros(config.num_classes).cuda()
-    correct = torch.zeros(config.num_classes).cuda()
+    # print(x_tsne.shape, y_tsne.shape)
+    # plt.figure(figsize=(16,16))
+    # plt.scatter(x=x_tsne,y=y_tsne,c=labels.reshape(len(x_train)))
+    # plt.title("t-sne on raw pixelvalues cifar10")
+    # plt.colorbar()
+    # plt.plot()
+    # plt.show()
 
-    confidence = np.array([])
-    pred_class = np.array([])
-    true_class = np.array([])
-
-    with torch.no_grad():
-        end = time.time()
-        for i, (images, target) in enumerate(val_loader):
-            if config.gpu is not None:
-                images = images.cuda(config.gpu, non_blocking=True)
-            if torch.cuda.is_available():
-                target = target.cuda(config.gpu, non_blocking=True)
-
-            # compute output
-            # if config.dataset == 'places':
-            #     feat = block(model(images))
-            # else:
-            feat = model(images)
-            
-            if lda is not None:
-                output = lda.logit(feat)
-            else:
-                output = classifier(feat)
-
-            lws_model.cuda() 
-            output.cuda()
-            output = lws_model(output)
-            loss = criterion(output, target)
-
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images.size(0))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
-
-            _, predicted = output.max(1)
-            target_one_hot = F.one_hot(target, config.num_classes)
-            predict_one_hot = F.one_hot(predicted, config.num_classes)
-            class_num = class_num + target_one_hot.sum(dim=0).to(torch.float)
-            correct = correct + (target_one_hot + predict_one_hot == 2).sum(dim=0).to(torch.float)
-
-            prob = torch.softmax(output, dim=1)
-            # prob = lda.predict_proba(feat)
-            confidence_part, pred_class_part = torch.max(prob, dim=1)
-            confidence = np.append(confidence, confidence_part.cpu().numpy())
-            pred_class = np.append(pred_class, pred_class_part.cpu().numpy())
-            true_class = np.append(true_class, target.cpu().numpy())
-
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if i % config.print_freq == 0:
-                progress.display(i, logger)
-
-        acc_classes = correct / class_num
-        head_acc = acc_classes[config.head_class_idx[0]:config.head_class_idx[1]].mean() * 100
-        med_acc = acc_classes[config.med_class_idx[0]:config.med_class_idx[1]].mean() * 100
-        tail_acc = acc_classes[config.tail_class_idx[0]:config.tail_class_idx[1]].mean() * 100
-
-        logger.info('* Acc@1 {top1.avg:.3f}% Acc@5 {top5.avg:.3f}% HAcc {head_acc:.3f}% MAcc {med_acc:.3f}% TAcc {tail_acc:.3f}%.'.format(top1=top1, top5=top5, head_acc=head_acc, med_acc=med_acc, tail_acc=tail_acc))
-
-        cal = calibration(true_class, pred_class, confidence, num_bins=15)
-        logger.info('* ECE   {ece:.3f}%.'.format(ece=cal['expected_calibration_error'] * 100))
-
-    return top1.avg, cal['expected_calibration_error'] * 100
+def scale_to_01_range(x):
+    value_range = (np.max(x) - np.min(x))
+    starts_from_zero = x - np.min(x)
+    return starts_from_zero / value_range
 
 
 if __name__ == '__main__':
