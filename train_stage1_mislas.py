@@ -220,6 +220,21 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
     if config.distributed:
         train_sampler = dataset.dist_sampler
 
+    ## uncomment for gmm
+    # head_features, head_labels = [], []
+    # with torch.no_grad():
+    #     for i, (images, target) in enumerate(train_loader):
+    #         images = images.cuda()
+    #         feat = model(images).cpu().numpy()
+    #         for j in range(target.shape[0]):
+    #             if target[j] in [k for k in range(config.tail_class_idx[0], config.tail_class_idx[1])]:
+    #                 head_features.append(feat[j])
+    #                 head_labels.append(target.numpy())
+    # head_features = np.concatenate(head_features, axis=0)
+    # head_labels = np.concatenate(head_labels, axis=0)
+    # grid_search = GridSearchCV(GaussianMixture(), param_grid=param_grid, scoring=gmm_bic_score)
+    # grid_search.fit(head_features)
+
     # define loss function (criterion) and optimizer
     # cls_dist = np.unique(train_loader.dataset.targets, return_counts=True)[1]
     # criterion = lambda x, y: CB_loss(logits=x, labels=y, samples_per_cls=cls_dist, no_of_classes=10, loss_type="softmax", beta=0.9999, gamma=2.0)
@@ -348,7 +363,23 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
         if torch.cuda.is_available():
             images = images.cuda(config.gpu, non_blocking=True)
             target = target.cuda(config.gpu, non_blocking=True)
-
+                
+        # # we apply extra strong augmentation to tail classes
+        # randaug = transforms.Compose([transforms.RandAugment(num_ops=3), # transforms.AugMix(severity=6)
+        #             transforms.ToTensor()])
+        # ## mid classes
+        # # randaug2 = transforms.Compose([transforms.AugMix(severity=3, mixture_width=2),
+        # #             transforms.ToTensor()])       
+        # for j in range(target.shape[0]):
+        #     if target[j] in [k for k in range(config.tail_class_idx[0], config.tail_class_idx[1])]:
+        #         pil = transforms.ToPILImage()
+        #         im = pil(images[j])
+        #         images[j] = randaug(im)
+        #     # elif target[j] in [k for k in range(config.med_class_idx[0], config.med_class_idx[1])]:
+        #     #     pil = transforms.ToPILImage()
+        #     #     im = pil(images[j])
+        #     #     images[j] = randaug2(im)
+        
         if config.mixup is True:
             targets_a, targets_b, lam, x1, x2 = mixup_data(images, target, alpha=config.alpha)
             if config.dataset == 'places':

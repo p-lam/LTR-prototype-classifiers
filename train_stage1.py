@@ -234,23 +234,8 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
     if config.distributed:
         train_sampler = dataset.dist_sampler
 
-    ## uncomment for gmm
-    # head_features, head_labels = [], []
-    # with torch.no_grad():
-    #     for i, (images, target) in enumerate(train_loader):
-    #         images = images.cuda()
-    #         feat = model(images).cpu().numpy()
-    #         for j in range(target.shape[0]):
-    #             if target[j] in [k for k in range(config.tail_class_idx[0], config.tail_class_idx[1])]:
-    #                 head_features.append(feat[j])
-    #                 head_labels.append(target.numpy())
-    # head_features = np.concatenate(head_features, axis=0)
-    # head_labels = np.concatenate(head_labels, axis=0)
-    # grid_search = GridSearchCV(GaussianMixture(), param_grid=param_grid, scoring=gmm_bic_score)
-    # grid_search.fit(head_features)
-
+    # define loss and optimizer
     cls_dist = np.unique(train_loader.dataset.targets, return_counts=True)[1]
-    # criterion = lambda x, y: CB_loss(logits=x, labels=y, samples_per_cls=cls_dist, no_of_classes=10, loss_type="softmax", beta=0.9999, gamma=2.0)
     criterion = nn.CrossEntropyLoss().cuda(config.gpu)
 
     if config.dataset == 'places':
@@ -264,6 +249,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
                                     momentum=config.momentum,
                                     weight_decay=config.weight_decay)
 
+    # train/val loop
     results = {'train_loss':[], 'val_loss@1':[], 'test_acc@1':[]}
     train_losses, val_losses = [], []
     for epoch in range(config.num_epochs):
@@ -329,31 +315,6 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
         [losses, top1],
         prefix="Epoch: [{}]".format(epoch))
 
-    # if epoch == 1: #fit lda once at beginning of training
-    #     model.eval()
-    #     classifier.eval()
-    #     lda_loader = dataset.lda
-    #     model.eval()
-    #     features = []
-    #     labels = []
-    #     with torch.no_grad():
-    #         for i, (images, target) in enumerate(lda_loader):
-    #             images = images.cuda()
-    #             feat = model(images).cpu().numpy()
-    #             features.append(feat)
-    #             labels.append(target.numpy())
-    #     features = np.concatenate(features, axis=0)
-    #     labels = np.concatenate(labels, axis=0)
-
-    #     features = torch.from_numpy(features).cuda()
-    #     labels = torch.from_numpy(labels).cuda()
-
-    #     # fit lda on features
-    #     lda = LDA(n_classes=config.num_classes, lamb=1e-3)
-    #     lda.forward(features, labels)
-    #     classifier.fc.weight.data = lda.coef_.cuda().float()
-    #     classifier.fc.bias.data = lda.intercept_.cuda().float()
-
     # switch to train mode
     if config.dataset == 'places':
         model.eval()
@@ -376,23 +337,7 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
         if torch.cuda.is_available():
             images = images.cuda(config.gpu, non_blocking=True)
             target = target.cuda(config.gpu, non_blocking=True)
-        
-        # # we apply extra strong augmentation to tail classes
-        # randaug = transforms.Compose([transforms.RandAugment(num_ops=3), # transforms.AugMix(severity=6)
-        #             transforms.ToTensor()])
-        # ## mid classes
-        # # randaug2 = transforms.Compose([transforms.AugMix(severity=3, mixture_width=2),
-        # #             transforms.ToTensor()])       
-        # for j in range(target.shape[0]):
-        #     if target[j] in [k for k in range(config.tail_class_idx[0], config.tail_class_idx[1])]:
-        #         pil = transforms.ToPILImage()
-        #         im = pil(images[j])
-        #         images[j] = randaug(im)
-        #     # elif target[j] in [k for k in range(config.med_class_idx[0], config.med_class_idx[1])]:
-        #     #     pil = transforms.ToPILImage()
-        #     #     im = pil(images[j])
-        #     #     images[j] = randaug2(im)
-        
+
         if config.mixup is True:
             images, targets_a, targets_b, lam = mixup_data(images, target, alpha=config.alpha)
             if config.dataset == 'places':
@@ -400,20 +345,12 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
                     feat_a = model(images)
                 feat = block(feat_a.detach())
                 output = classifier(feat)
-            else:
-                # feat, targets_a, targets_b, lam = model(images, target)
+            else: # for cifar and imagenet
                 feat = model(images)
-                # feat, targets_a, targets_b, lam = mixup_data(feat, target, alpha=config.alpha)
                 output = classifier(feat)
-            #     targets_a_onehot = to_one_hot(targets_a, config.num_classes)
-            #     targets_b_onehot = to_one_hot(targets_b, config.num_classes)
-            #     target_reweighted = targets_a_onehot * lam + targets_b_onehot * (1. - lam)
-            # softmax = nn.Softmax(dim=1).cuda()
-            # bce_loss = nn.BCELoss().cuda()
-            # loss = bce_loss(softmax(output),target_reweighted)
-            
+            # mixup loss
             loss = mixup_criterion(criterion, output, targets_a, targets_b, lam)
-        else:
+        else: # no mixup
             if config.dataset == 'places':
                 with torch.no_grad():
                     feat_a = model(images)
@@ -478,7 +415,7 @@ def validate(val_loader, model, classifier, criterion, config, logger, block=Non
 
             # compute output
             feat = model(images)
-            # feat = model(images, target=None, mixup_hidden=False)
+
             if config.dataset == 'places':
                 feat = block(feat)
             output = classifier(feat)
@@ -553,20 +490,6 @@ def adjust_learning_rate(optimizer, epoch, config):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-def mixup_process(out, target_reweighted, lam):
-    # target_reweighted is one-hot vector
-    # target is the taerget class.
-
-    # shuffle indices of mini-batch
-    indices = np.random.permutation(out.size(0))
-
-    out = out*lam.expand_as(out) + out[indices]*(1-lam.expand_as(out))
-    target_shuffled_onehot = target_reweighted[indices]
-    target_reweighted = target_reweighted * lam.expand_as(target_reweighted) + target_shuffled_onehot * (1 - lam.expand_as(target_reweighted))
-    return out, target_reweighted
-
-def to_one_hot(target, num_classes):
-    return F.one_hot(target, num_classes)
 
 if __name__ == '__main__':
     main()
