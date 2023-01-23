@@ -36,7 +36,10 @@ from utils import config, update_config, create_logger
 from utils import AverageMeter, ProgressMeter
 from utils import accuracy, calibration
 from lda import LDA
+
 from vos import vos_sampling_step
+from torch.utils.data import TensorDataset, DataLoader
+from torch.distributions import Categorical
 
 from methods import mixup_data, mixup_criterion
 from sklearn.mixture import GaussianMixture 
@@ -261,7 +264,12 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
         if config.dataset != 'places':
             block = None
         # train for one epoch
-        train_loss = train(train_loader, model, classifier, criterion, optimizer, epoch, config, logger, dataset, block)
+
+        if epoch == 0:
+            train_loss, resampled_dataloader = train(train_loader, model, classifier, criterion, optimizer, epoch, config, logger, cls_dist, block)
+        else:
+            train_loss, resampled_dataloader = train(train_loader, model, classifier, criterion, optimizer, epoch, config, logger, cls_dist, resampled_dataloader, block)
+
         train_losses.append(train_loss)
         results['train_loss'].append(train_loss)
 
@@ -301,9 +309,9 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
                     'best_acc1': best_acc1,
                     'its_ece': its_ece,
                 }, is_best, model_dir)
+    
 
-
-def train(train_loader, model, classifier, criterion, optimizer, epoch, config, logger, dataset, block=None):
+def train(train_loader, model, classifier, criterion, optimizer, epoch, config, logger, cls_num_list, resampled_dataloader=None, block=None):
     # batch_time = AverageMeter('Time', ':6.3f')
     # data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.3f')
@@ -316,24 +324,28 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
         prefix="Epoch: [{}]".format(epoch))
 
     # fit vos at start of each epoch for simplicity
-    with torch.no_grad():
-        print("fitting VOS")
-        data = []
-        labels = []
-        for i, (images, target) in enumerate(train_loader):
-            labels.append(target.numpy())
-            data.append(model(images.cuda()).cpu().numpy())
-        data = np.concatenate(data)
-        labels = np.concatenate(labels)
-        from vos import vos_sampling_step
-        from torch.utils.data import TensorDataset, DataLoader
-        num_per_class = np.unique(labels, return_counts=True)[-1]
-        num_resample_per_class = [num_per_class[0] - num_per_class[i] for i in range(len(np.unique(labels)))]
-        resampled_data = vos_sampling_step(data, labels, num_resample_per_class, likelihood="lowest")
-        resampled_data = torch.concatenate(resampled_data, axis=0).reshape(np.sum(num_resample_per_class), -1)
-        resampled_labels = np.concatenate([[i]*num_resample_per_class[i] for i in range(len(np.unique(labels)))])
-    sampled_dataset = TensorDataset(resampled_data.float(), torch.tensor(resampled_labels).long())
-    resampled_dataloader = DataLoader(sampled_dataset, batch_size=train_loader.batch_size)
+    if epoch % 5 == 0:
+        with torch.no_grad():
+            print(f"fitting VOS at epoch {epoch}")
+            data = []
+            labels = []
+            for i, (images, target) in enumerate(train_loader):
+                labels.append(target.numpy())
+                data.append(model(images.cuda()).cpu().numpy())
+            data = np.concatenate(data)
+            labels = np.concatenate(labels)
+            
+            # resampled_rate = adjust_resampling_rate(cls_num_list, config)
+            # probs = resampled_rate.reshape(1,-1).repeat()
+
+            num_per_class = np.unique(labels, return_counts=True)[-1]
+            num_resample_per_class = [num_per_class[0] - num_per_class[i] for i in range(len(np.unique(labels)))]
+            resampled_data = vos_sampling_step(data, labels, num_resample_per_class, likelihood="lowest")
+            # resampled_data = torch.concatenate(resampled_data, axis=0).reshape(np.sum(num_resample_per_class), -1)
+            resampled_data = torch.cat(resampled_data, axis=0).reshape(np.sum(num_resample_per_class), -1)
+            resampled_labels = np.concatenate([[i]*num_resample_per_class[i] for i in range(len(np.unique(labels)))])
+        sampled_dataset = TensorDataset(resampled_data.float(), torch.tensor(resampled_labels).long())
+        resampled_dataloader = DataLoader(sampled_dataset, batch_size=train_loader.batch_size)
 
     # switch to train mode
     if config.dataset == 'places':
@@ -402,7 +414,7 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss = loss + (loss_synthetic * 0.3)
+        loss = loss + (loss_synthetic)
         loss.backward()
         optimizer.step()
 
@@ -413,6 +425,7 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, config, 
         if i % config.print_freq == 0:
             progress.display(i, logger)
 
+    return loss.detach().cpu().numpy(), resampled_dataloader
 
 def validate(val_loader, model, classifier, criterion, config, logger, block=None):
     # batch_time = AverageMeter('Time', ':6.3f')
@@ -522,6 +535,17 @@ def adjust_learning_rate(optimizer, epoch, config):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
+
+def adjust_resampling_rate(cls_num_list, config):
+    cls_rate = np.array(cls_num_list) / np.array(cls_num_list).sum()
+    print(f"Original class rate: ", cls_rate)
+    if config.alpha > 0:
+        rebalance_rate = torch.from_numpy(config.alpha - cls_rate).cuda()
+    else:
+        rebalance_rate = torch.from_numpy(cls_rate.max() + cls_rate.min() - cls_rate).cuda()
+    print(f"Rebalance rate: ", rebalance_rate)
+
+    return rebalance_rate 
 
 if __name__ == '__main__':
     main()

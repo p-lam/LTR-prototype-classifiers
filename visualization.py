@@ -7,6 +7,7 @@ import pprint
 import pandas as pd 
 import torchvision.transforms as transforms 
 import matplotlib.pyplot as plt 
+import seaborn as sns 
 
 import torch
 import torch.nn as nn
@@ -231,6 +232,32 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
     images = np.concatenate(imgs, axis=0)
     labels = np.concatenate(labels, axis=0)
 
+    labels, counts = torch.unique(labels, return_counts=True)
+    # assert len(labels) == n_classes  # require X,y cover all classes
+
+    # compute mean-centered observations and covariance matrix
+    N, D = images.shape
+    X_bar = images - torch.mean(images, 0)
+    St = X_bar.T.matmul(X_bar) / N  # total scatter matrix
+    Sw = torch.zeros((D, D), dtype=images.dtype, device=images.device, requires_grad=False)  # within-class scatter matrix
+    X, y = images, labels 
+    means = []
+    for i in range(config.num_classes):
+        Xg = X[y == i]
+        means.append(torch.mean(Xg, dim=0))
+    Xg_mean = torch.stack(means, dim=0)       
+
+    for c, Nc in zip(labels, counts):
+        # Xg = X[y == c]
+        # Xg_mean[int(c), :] = torch.mean(Xg, 0)
+        # Xg_bar = Xg - Xg_mean[int(c), :]
+        Xg = X[y == c]                                                                  # [None, d]
+        Xg_bar = Xg - torch.mean(Xg, dim=0, keepdim=True)                               # [None, d]
+        Sw = Sw + (Xg_bar.T.matmul(Xg_bar) / Nc)
+    Sw /= config.num_classes
+    Sw = Sw.detach().cpu().numpy()
+    sns.lineplot(Sw)
+    
     # filtered = [] 
     # cnt1, cnt2, cnt3 = 0, 0, 0 
     # for i, j in zip(images, labels):

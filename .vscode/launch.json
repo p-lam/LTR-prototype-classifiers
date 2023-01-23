@@ -12,7 +12,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "args": ["--cfg", "./config/cifar100/cifar100_imb001_stage1_mixup.yaml","name", "test", "mixup", "True"]
+            "args": ["--cfg", "./config/cifar100/cifar100_imb001_stage1_mixup.yaml","name", "test", "mixup", "False"]
         }
     ]
 }
