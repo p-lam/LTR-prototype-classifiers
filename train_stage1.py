@@ -246,8 +246,8 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
     else:
         optimizer = torch.optim.SGD([{"params": model.parameters()},
                                     {"params": classifier.parameters()}], config.lr,
-                                    momentum=config.momentum,
-                                    weight_decay=config.weight_decay)
+                                    momentum=config.momentum)
+                                    # weight_decay=config.weight_decay)
 
     # train/val loop
     results = {'train_loss':[], 'val_loss@1':[], 'test_acc@1':[]}

@@ -5,6 +5,8 @@ import torch
 import torchvision
 from torchvision import transforms
 import torchvision.datasets
+from utils.aug import Cutout
+
 
 class IMBALANCECIFAR100(torchvision.datasets.CIFAR100):
     cls_num = 100
@@ -58,22 +60,19 @@ class IMBALANCECIFAR100(torchvision.datasets.CIFAR100):
         return cls_num_list
 
 
-
-
-
-
 class CIFAR100_LT(object):
     def __init__(self, distributed, root='./data/cifar100', imb_type='exp',
                     imb_factor=0.01, batch_size=128, num_works=40):
 
         train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            Cutout(n_holes=1, length=16),
         ])
 
-        
 
         eval_transform = transforms.Compose([
             transforms.ToTensor(),
@@ -102,7 +101,7 @@ class CIFAR100_LT(object):
         self.eval = torch.utils.data.DataLoader(
             eval_dataset,
             batch_size=batch_size, shuffle=False,
-            num_workers=num_works, pin_memory=True)
+            num_workers=num_works, pin_memory=True, drop_last=True)
         
         self.lda_sampler = torch.utils.data.distributed.DistributedSampler(lda_dataset) if distributed else None
         self.lda = torch.utils.data.DataLoader(

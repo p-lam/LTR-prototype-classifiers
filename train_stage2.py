@@ -17,7 +17,6 @@ import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
 import torch.nn.functional as F
-from lda import LDA
 
 from datasets.cifar10 import CIFAR10_LT
 from datasets.cifar100 import CIFAR100_LT
@@ -32,11 +31,12 @@ from models import resnet_cifar
 from utils import config, update_config, create_logger
 from utils import AverageMeter, ProgressMeter
 from utils import accuracy, calibration
+from utils import logadj
 
 from methods import mixup_data, mixup_criterion
-from methods import LabelAwareSmoothing, LearnableWeightScaling
-from modules.cb_loss import CB_loss
-from modules.regularizer import RegularizedLogit
+from methods import LearnableWeightScaling
+from models.prototype_learning import LearnedPrototypes
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='MiSLAS training (Stage-2)')
@@ -131,6 +131,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
                                                      dilation=1, norm_layer=nn.BatchNorm2d)
 
     lws_model = LearnableWeightScaling(num_classes=config.num_classes)
+
     if not torch.cuda.is_available():
         logger.info('using CPU, this will be slow')
     elif config.distributed:
@@ -235,32 +236,66 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
         train_sampler = dataset.dist_sampler
 
     # define loss function (criterion) and optimizer
+
     # criterion = LabelAwareSmoothing(cls_num_list=cls_num_list, smooth_head=config.smooth_head,
     #                                 smooth_tail=config.smooth_tail).cuda(config.gpu)
-    cls_dist = np.unique(train_loader.dataset.targets, return_counts=True)[1]
-    criterion = lambda x, y: CB_loss(logits=x, labels=y, samples_per_cls=cls_dist, no_of_classes=10, loss_type="softmax", beta=0.9999, gamma=2.0)
 
-    optimizer = torch.optim.SGD([{"params": classifier.parameters()},
-                                {'params': lws_model.parameters()}], config.lr,
-                                momentum=config.momentum,
-                                weight_decay=config.weight_decay)
+    criterion = nn.CrossEntropyLoss().cuda()
 
-    hidden_dim, num_classes = 64, 10
-    wlr = 0.02
+    # train/val loop
+    results = {'train_loss':[], 'val_loss@1':[], 'test_acc@1':[]}
+    train_losses, val_losses = [], []
+
+    model.eval()
+    features = []
+    labels = []
+    with torch.no_grad():
+        for i, (images, target) in enumerate(dataset.train_instance):
+            images = images.cuda()
+            feat = model(images).cpu().numpy()
+            features.append(feat)
+            labels.append(target.numpy())
+    features = np.concatenate(features, axis=0)
+    labels = np.concatenate(labels, axis=0)
+    features = torch.from_numpy(features).cuda()
+    labels = torch.from_numpy(labels).cuda()
+
+    # initialize class prototypes
+    means = []
+    for i in range(config.num_classes):
+        Xg = features[labels == i]
+        means.append(torch.mean(Xg, dim=0))
+    prototypes = torch.stack(means, dim=0)
+    prototypes = prototypes.T
+
+    # model init 
+    def create_model(model, classifier, prototypes):
+        proto = LearnedPrototypes(model, classifier, n_prototypes=config.num_classes, prototypes=prototypes, device="cuda")
+        return proto.cuda()
+
+    proto_model = create_model(model, classifier, prototypes)
+    
+    tro_train = 1/4
+    logit_adjustments = logadj.compute_adjustment(train_loader, tro_train) 
+
+    # 1-stage training
+    proto_lr = 2e-3
+    optimizer = torch.optim.SGD(proto_model.parameters(),
+                            proto_lr,
+                            momentum=config.momentum,
+                            weight_decay=2e-4)
 
     for epoch in range(config.num_epochs):
         if config.distributed:
             train_sampler.set_epoch(epoch)
-        w_dict = {i: None for i in range(num_classes)}
-        adjust_learning_rate(optimizer, epoch, config)
+
+        adjust_learning_rate(optimizer, epoch, proto_lr, config)
 
         if config.dataset != 'places':
             block = None
         # train for one epoch
-        train(train_loader, model, classifier, lws_model, criterion, optimizer, epoch, config, logger, w_dict, dataset, block)
+        acc1, ece = train(train_loader, val_loader, proto_model, logit_adjustments, lws_model, criterion, optimizer, epoch, config, logger, block)
 
-        # evaluate on validation set
-        acc1, ece = validate(val_loader, model, classifier, lws_model, criterion, config, logger, block)
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
@@ -290,134 +325,61 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
                 }, is_best, model_dir)
 
 
-def train(train_loader, model, classifier, lws_model, criterion, optimizer, epoch, config, logger, w_dict, dataset, block=None):
-    batch_time = AverageMeter('Time', ':6.3f')
-    data_time = AverageMeter('Data', ':6.3f')
+def train(train_loader, val_loader, proto_model, logit_adjustments, lws_model, criterion, optimizer, epoch, config, logger, block=None):
     losses = AverageMeter('Loss', ':.3f')
     top1 = AverageMeter('Acc@1', ':6.3f')
-    top5 = AverageMeter('Acc@5', ':6.3f')
-    training_data_num = len(train_loader.dataset)
-    end_steps = int(np.ceil(float(training_data_num) / float(train_loader.batch_size)))
+    total_num, total_loss = 0, 0.0
     progress = ProgressMeter(
-        end_steps,
-        [batch_time, losses, top1, top5],
+        len(train_loader),
+        [losses, top1],
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
-
-    if config.dataset == 'places':
-        model.eval()
-        if config.shift_bn:
-            block.train()
-        else:
-            block.eval()
-    else:
-        if config.shift_bn:
-            model.train()
-        else:
-            model.eval()
-    classifier.train()
-
-    end = time.time()
+    proto_model.train()
+    training_data_num = len(train_loader.dataset)
+    end_steps = int(training_data_num / train_loader.batch_size)
+   
+    # temp = torch.rand(size=(64,64), device="cuda").requires_grad_(True)
+    temp = torch.eye(64, device="cuda").requires_grad_(True)
+    temp_lr = 1e-4
+    optimizer_temp = torch.optim.SGD([temp],
+                                    temp_lr,
+                                    momentum=config.momentum,
+                                    weight_decay=2e-4)                                
+    adjust_learning_rate(optimizer_temp, epoch, temp_lr, config)
 
     for i, (images, target) in enumerate(train_loader):
         if i > end_steps:
             break
-        
-        # measure data loading time
-        data_time.update(time.time() - end)
 
         if torch.cuda.is_available():
             images = images.cuda(config.gpu, non_blocking=True)
             target = target.cuda(config.gpu, non_blocking=True)
-
-        if epoch == 0: #fit lda once at beginning of training
-            model.eval()
-            classifier.eval()
-            lda_loader = dataset.lda
-            model.eval()
-            features = []
-            labels = []
-            with torch.no_grad():
-                for i, (images, target) in enumerate(lda_loader):
-                    images = images.cuda()
-                    feat = model(images).cpu().numpy()
-                    features.append(feat)
-                    labels.append(target.numpy())
-            features = np.concatenate(features, axis=0)
-            labels = np.concatenate(labels, axis=0)
-
-            features = torch.from_numpy(features).cuda()
-            labels = torch.from_numpy(labels).cuda()
-
-            # fit lda on features
-            lda = LDA(n_classes=10, lamb=1e-3)
-            lda.forward(features, labels)
-            classifier.fc.weight.data = lda.coef_.cuda().float()
-            classifier.fc.bias.data = lda.intercept_.cuda().float()
-
-        if config.mixup is True:
-            images, targets_a, targets_b, lam = mixup_data(images, target, alpha=config.alpha)
-            with torch.no_grad():
-                if config.dataset == 'places':
-                    feat = block(model(images))
-                else:
-                    feat = model(images)
-            # output = classifier(feat.detach())
-            # output = lws_model(output)
-            W = classifier.fc.weight.data.detach()
-            W = F.normalize(W, p=2.0, dim=1).detach().requires_grad_(True)
-            features_detach = feat.detach().requires_grad_(False).cuda()
-
-            for k in range(50):
-                for i in range(W.shape[0]):
-                    logit = w_dict[i]   
-                if logit == None:
-                    logit = RegularizedLogit(W, features_detach, criterion, target, 0.5, 0.02, config.weight_decay, config)
-                    w_dict[i] = logit
-                else: 
-                    logit.W = W
-                    logit.features = features_detach
-                    logit.labels = target 
-                
-                W, train_loss, w_grad = logit(i,k)
-                W = W.cuda()
-            
-            classifier.fc.weight.data = W.requires_grad_(False)
-            feat.requires_grad = True
-            output = torch.einsum('ij,jk->ik', feat, (classifier.fc.weight.data).T)
-            # update model with the new output
-            loss = mixup_criterion(criterion, output, targets_a, targets_b, lam)
-        else:
-            # compute output
-            with torch.no_grad():
-                if config.dataset == 'places':
-                    feat = block(model(images))
-                else:
-                    feat = model(images)
-            output = classifier(feat.detach())
-            output = lws_model(output)
-            loss = criterion(output, target)
+            output = proto_model(images, temp) 
+            output = output + logit_adjustments
+            loss = criterion(output, target) 
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        total_num += train_loader.batch_size 
+        total_loss += loss.item() * train_loader.batch_size 
         losses.update(loss.item(), images.size(0))
         top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
+        optimizer_temp.zero_grad()
         loss.backward()
         optimizer.step()
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
+        optimizer_temp.step()
         if i % config.print_freq == 0:
             progress.display(i, logger)
 
+    # evaluate on test set
+    acc1, ece = validate(val_loader, proto_model, logit_adjustments, temp, lws_model, criterion, config, logger, block)
+    return acc1, ece 
 
-def validate(val_loader, model, classifier, lws_model, criterion, config, logger, block=None):
+
+def validate(val_loader, proto_model, logit_adjustments, temp, lws_model, criterion, config, logger, block=None):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.3f')
     top1 = AverageMeter('Acc@1', ':6.3f')
@@ -428,10 +390,7 @@ def validate(val_loader, model, classifier, lws_model, criterion, config, logger
         prefix='Eval: ')
 
     # switch to evaluate mode
-    model.eval()
-    if config.dataset == 'places':
-        block.eval()
-    classifier.eval()
+    proto_model.eval()
     class_num = torch.zeros(config.num_classes).cuda()
     correct = torch.zeros(config.num_classes).cuda()
 
@@ -448,13 +407,8 @@ def validate(val_loader, model, classifier, lws_model, criterion, config, logger
                 target = target.cuda(config.gpu, non_blocking=True)
 
             # compute output
-            if config.dataset == 'places':
-                feat = block(model(images))
-            else:
-                feat = model(images)
-            output = classifier(feat)
-            output = lws_model(output)
-            loss = criterion(output, target)
+            output = proto_model(images, temp) 
+            loss = criterion(output, target) 
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -494,43 +448,25 @@ def validate(val_loader, model, classifier, lws_model, criterion, config, logger
     return top1.avg, cal['expected_calibration_error'] * 100
 
 
-
 def save_checkpoint(state, is_best, model_dir):
     filename = model_dir + '/current.pth.tar'
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, model_dir + '/model_best.pth.tar')
 
-# cosine annealing lr scheduler for training
-def adjust_learning_rate(optimizer, epoch, config):
-    """
-    Decay the learning rate based on schedule
-    """
-    lr = config.lr 
-    if config.cos:  # cosine lr schedule
-        lr *= 0.5 * (1. + math.cos(math.pi * epoch / config.num_epochs))
-    else:  # stepwise lr schedule
-        for milestone in [160, 180]:
-            lr *= 0.1 if epoch >= milestone else 1.
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-# def adjust_learning_rate(optimizer, epoch, config):
-#     """Sets the learning rate"""
-#     lr_min = 0
-#     lr_max = config.lr
-#     lr = lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(epoch / config.num_epochs * 3.1415926535))
 
-#     for idx, param_group in enumerate(optimizer.param_groups):
-#         if idx == 0:
-#             param_group['lr'] = config.lr_factor * lr
-#         else:
-#             param_group['lr'] = 1.00 * lr
+def adjust_learning_rate(optimizer, epoch, lr, config):
+    """Sets the learning rate"""
+    lr_min = 0
+    lr_max = lr
+    lr = lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(epoch / config.num_epochs * 3.1415926535))
 
+    for idx, param_group in enumerate(optimizer.param_groups):
+        if idx == 0:
+            param_group['lr'] = config.lr_factor * lr
+        else:
+            param_group['lr'] = 1.00 * lr
 
-def initialize_W(in_dim, out_dim): #in_dim=feature_dim, out_dim=num_classes
-    W = torch.rand((out_dim, in_dim), requires_grad=True)
-    W = F.normalize(W, p=2.0, dim=1)
-    return W
 
 if __name__ == '__main__':
     main()

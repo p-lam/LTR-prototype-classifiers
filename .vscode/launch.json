@@ -12,7 +12,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "args": ["--cfg", "./config/cifar100/cifar100_imb001_stage1_mixup.yaml","name", "test", "mixup", "False"]
+            "args": ["--cfg", "./config/cifar100/cifar100_imb001_stage2_mislas.yaml","name", "test", "resume", "saved/cifar100_2e-4/ckps/current.pth.tar"]
         }
     ]
 }

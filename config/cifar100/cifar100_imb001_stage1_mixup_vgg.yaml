@@ -38,7 +38,7 @@ multiprocessing_distributed: False
 mode: 'stage1'
 lr: 0.1
 batch_size: 128
-weight_decay: 2e-4
+weight_decay: 1e-6
 num_epochs: 200
 momentum: 0.9
 cos: False

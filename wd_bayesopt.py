@@ -1,10 +1,14 @@
 import argparse
 import os
 import random
+import shutil
 import time
 import warnings
 import numpy as np
 import pprint
+import math
+import pandas as pd 
+import torchvision.transforms as transforms 
 
 import torch
 import torch.nn as nn
@@ -15,27 +19,59 @@ import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
 import torch.nn.functional as F
+from modules.cb_loss import CB_loss
+from torch.optim import lr_scheduler 
 
+from functools import partial
 from datasets.cifar10 import CIFAR10_LT
 from datasets.cifar100 import CIFAR100_LT
 from datasets.places import Places_LT
 from datasets.imagenet import ImageNet_LT
 from datasets.ina2018 import iNa2018
-from lda import LDA
+from ray.tune import CLIReporter
+from ax.plot.contour import plot_contour
+from ax.plot.trace import optimization_trace_single_method
+from ax.service.managed_loop import optimize
+from ax.utils.notebook.plotting import render
+from ax.utils.tutorials.cnn_utils import train, evaluate
 
 from models import resnet
 from models import resnet_places
 from models import resnet_cifar
+from models import vgg 
+
+from bayes_opt import BayesianOptimization
+from bayes_opt.util import Colours 
+import ray 
+from ray import tune 
+from ray.air import session 
+from ray.tune.search import ConcurrencyLimiter
+from ray.tune.search.bayesopt import BayesOptSearch
+from ray.tune.schedulers import AsyncHyperBandScheduler, ASHAScheduler
 
 from utils import config, update_config, create_logger
 from utils import AverageMeter, ProgressMeter
 from utils import accuracy, calibration
+from lda import LDA
 from vos import vos_sampling_step
-from methods import LearnableWeightScaling
 
+from methods import mixup_data, mixup_criterion
+from sklearn.mixture import GaussianMixture 
+from sklearn.model_selection import GridSearchCV
+
+
+param_grid = {
+    "n_components": 30,
+    "covariance_type": ["tied"], # "spherical", "tied", "diag", "full"
+    "random_state": 0
+}
+
+
+def gmm_bic_score(estimator, X):
+    return -estimator.bic(X)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='MiSLAS evaluation')
+    parser = argparse.ArgumentParser(description='MiSLAS training (Stage-1)')
     parser.add_argument('--cfg',
                         help='experiment configure file name',
                         required=True,
@@ -44,7 +80,6 @@ def parse_args():
                         help="Modify config options using the command-line",
                         default=None,
                         nargs=argparse.REMAINDER)
-
     args = parser.parse_args()
     update_config(config, args)
 
@@ -52,7 +87,8 @@ def parse_args():
 
 
 best_acc1 = 0
-
+its_ece = 100
+t = 0.5
 
 def main():
     args = parse_args()
@@ -94,7 +130,7 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
-    global best_acc1
+    global best_acc1, its_ece
     config.gpu = gpu
 #     start_time = time.strftime("%Y%m%d_%H%M%S", time.localtime())
 
@@ -113,9 +149,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
 
     if config.dataset == 'cifar10' or config.dataset == 'cifar100':
         model = getattr(resnet_cifar, config.backbone)()
-        # model = getattr(vgg, config.backbone)()
         classifier = getattr(resnet_cifar, 'Classifier')(feat_in=64, num_classes=config.num_classes)
-        # classifier = getattr(vgg, 'Classifier')(feat_in=512, num_classes=config.num_classes)
 
     elif config.dataset == 'imagenet' or config.dataset == 'ina2018':
         model = getattr(resnet, config.backbone)()
@@ -124,11 +158,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
     elif config.dataset == 'places':
         model = getattr(resnet_places, config.backbone)(pretrained=True)
         classifier = getattr(resnet_places, 'Classifier')(feat_in=2048, num_classes=config.num_classes)
-        block = getattr(resnet_places, 'Bottleneck')(2048, 512, groups=1,
-                                                     base_width=64, dilation=1,
-                                                     norm_layer=nn.BatchNorm2d)
-
-    lws_model = LearnableWeightScaling(num_classes=config.num_classes)
+        block = getattr(resnet_places, 'Bottleneck')(2048, 512, groups=1, base_width=64, dilation=1, norm_layer=nn.BatchNorm2d)
 
     if not torch.cuda.is_available():
         logger.info('using CPU, this will be slow')
@@ -140,7 +170,6 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
             torch.cuda.set_device(config.gpu)
             model.cuda(config.gpu)
             classifier.cuda(config.gpu)
-            lws_model.cuda(config.gpu)
             # When using a single GPU per process and per
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
@@ -148,24 +177,19 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
             config.workers = int((config.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.gpu])
             classifier = torch.nn.parallel.DistributedDataParallel(classifier, device_ids=[config.gpu])
-            lws_model = torch.nn.parallel.DistributedDataParallel(lws_model, device_ids=[config.gpu])
-
             if config.dataset == 'places':
                 block.cuda(config.gpu)
                 block = torch.nn.parallel.DistributedDataParallel(block, device_ids=[config.gpu])
         else:
             model.cuda()
             classifier.cuda()
-            lws_model.cuda()
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             model = torch.nn.parallel.DistributedDataParallel(model)
             classifier = torch.nn.parallel.DistributedDataParallel(classifier)
-            lws_model = torch.nn.parallel.DistributedDataParallel(lws_model)
             if config.dataset == 'places':
                 block.cuda()
                 block = torch.nn.parallel.DistributedDataParallel(block)
-
     elif config.gpu is not None:
         torch.cuda.set_device(config.gpu)
         model = model.cuda(config.gpu)
@@ -176,33 +200,8 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
         # DataParallel will divide and allocate batch_size to all available GPUs
         model = torch.nn.DataParallel(model).cuda()
         classifier = torch.nn.DataParallel(classifier).cuda()
-        lws_model = torch.nn.DataParallel(lws_model).cuda()
         if config.dataset == 'places':
             block = torch.nn.DataParallel(block).cuda()
-
-    # optionally resume from a checkpoint
-    if config.resume:
-        if os.path.isfile(config.resume):
-            logger.info("=> loading checkpoint '{}'".format(config.resume))
-            if config.gpu is None:
-                checkpoint = torch.load(config.resume)
-            else:
-                # Map model to be loaded to specified single gpu.
-                loc = 'cuda:{}'.format(config.gpu)
-                checkpoint = torch.load(config.resume, map_location=loc)
-            if config.gpu is not None:
-                # best_acc1 may be from a checkpoint from a different GPU
-                best_acc1 = best_acc1
-            model.load_state_dict(checkpoint['state_dict_model'])
-            classifier.load_state_dict(checkpoint['state_dict_classifier'])
-            if config.dataset == 'places':
-                block.load_state_dict(checkpoint['state_dict_block'])
-            if config.mode == 'stage2':
-                lws_model.load_state_dict(checkpoint['state_dict_lws_model'])
-            logger.info("=> loaded checkpoint '{}' (epoch {})"
-                        .format(config.resume, checkpoint['epoch']))
-        else:
-            logger.info("=> no checkpoint found at '{}'".format(config.resume))
 
     # Data loading code
     if config.dataset == 'cifar10':
@@ -225,142 +224,170 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
         dataset = iNa2018(config.distributed, root=config.data_path,
                           batch_size=config.batch_size, num_works=config.workers)
 
+    # hacky way of combining model + classifier
+    full_model = RNClassifier(model, classifier)
+    full_model = full_model.cuda() 
+
+    # # load data with instance sampling
+    # train_loader = dataset.train_instance
+    # val_loader = dataset.eval
+
+    # criterion = nn.CrossEntropyLoss().cuda()
+
+    # train/val loop
+    # def train_evaluate(parametrization):
+    #     trained_net = train(train_loader, full_model, criterion, config, parameters=parametrization)
+    #     return evaluate(net=trained_net, data_loader=val_loader, dtype=torch.float, device='cuda')
+
+    # best_params, values, experiment, model = optimize(parameters=[{"name": "weight_decay", "type": "range", "bounds":[1e-3, 1e-2]}],
+    #                                                 evaluation_function=train_evaluate,
+    #                                                 objective_name='accuracy')
+    
+    algo = BayesOptSearch(utility_kwargs={"kind": "ucb", "kappa": 2.5, "xi": 0.0})
+    algo = ConcurrencyLimiter(algo, max_concurrent=4)
+    # scheduler = AsyncHyperBandScheduler(metric="loss", mode="min")
+    scheduler = ASHAScheduler(
+        metric="loss",
+        mode="min",
+        max_t=10,
+        grace_period=1,
+        reduction_factor=2)
+
+    reporter = CLIReporter(metric_columns=["loss", "accuracy", "training_iteration"])
+    result = tune.run(
+        tune.with_parameters(train, config=config),
+        # tune_config = tune.TuneConfig(
+        #     metric="mean_accuracy",
+        #     mode="min",
+        #     search_alg=algo,
+        #     scheduler=scheduler
+        # ),
+        resources_per_trial={"cpu": 16, "gpu": 1},
+        config={"wd": tune.uniform(5e-4, 5e-2)},
+        num_samples=10,
+        scheduler=scheduler,
+        progress_reporter=reporter
+    )
+
+    best_trial = result.get_best_trial("loss", "min", "last")
+    print("Best trial config: {}".format(best_trial.config))
+    print("Best trial final validation loss: {}".format(
+        best_trial.last_result["loss"]))
+    print("Best trial final validation accuracy: {}".format(
+        best_trial.last_result["accuracy"]))
+    print("Best hyperparameters found were: ", result.best_result().config)
+
+
+def train(cfg, config):
+    # switch to train mode
+    if config.dataset == 'cifar100':
+        m = getattr(resnet_cifar, config.backbone)()
+        classifier = getattr(resnet_cifar, 'Classifier')(feat_in=64, num_classes=config.num_classes)
+        dataset = CIFAR100_LT(config.distributed, root=config.data_path, imb_factor=config.imb_factor,
+                              batch_size=config.batch_size, num_works=config.workers)
+    torch.cuda.set_device(config.gpu)
+    m = m.cuda(config.gpu)
+    classifier = classifier.cuda(config.gpu)
+    
+    model = RNClassifier(m, classifier)
+    model = model.cuda() 
+
+    # load data with instance sampling
+    train_loader = dataset.train_instance
     val_loader = dataset.eval
-    criterion = nn.CrossEntropyLoss().cuda(config.gpu)
 
-    if config.dataset != 'places':
-        block = None
-
-    lda_loader = dataset.lda
-    model.eval()
-    features = []
-    labels = []
-    cls_dist = np.unique(lda_loader.dataset.targets, return_counts=True)[1]
-    with torch.no_grad():
-        for i, (images, target) in enumerate(lda_loader):
-            images = images.cuda()
-            feat = model(images).cpu().numpy()
-            features.append(feat)
-            labels.append(target.numpy())
-    features = np.concatenate(features, axis=0)
-    labels = np.concatenate(labels, axis=0)
-
-    features = torch.from_numpy(features).cuda()
-    labels = torch.from_numpy(labels).cuda()
-
-    N_SAMPLES_PER_CLASS = [cls_dist[0] - cls_dist[i] for i in range(config.num_classes)]
-
-    # try out method, sampling lowest likelihood parts of each ccg
-    resampled_data = vos_sampling_step(features.detach().cpu().numpy(), labels.detach().cpu().numpy(), N_SAMPLES_PER_CLASS, likelihood="lowest")
-    resampled_data = torch.cat(resampled_data, axis=0) # flatten from (num_classes, N_c, 64) to (N, 64)
-    print(resampled_data.shape)
-    resampled_labels = torch.from_numpy(np.concatenate([[i] * N_SAMPLES_PER_CLASS[i] for i in range(config.num_classes)])).cuda()
-    print(resampled_labels.shape)
-    # fit lda on features
+    criterion = nn.CrossEntropyLoss().cuda()
     
-    # combine resampled and original data
-    all_features = torch.cat([features, resampled_data], dim=0)
+    model.train()
+    total_num, total_loss = 0.0, 0.0
+    training_data_num = len(train_loader.dataset)
+    end_steps = int(training_data_num / train_loader.batch_size)
 
-    ## uncomment for manifold mixup 
-    # lam = np.random.beta(1.0,1.0)
-    # batch_size = all_features.size()[0]
-    # index = torch.randperm(batch_size).cuda()
-    # all_features = lam * all_features + (1. - lam) * all_features[index, :]
+    optimizer = torch.optim.SGD(model.parameters(), config.lr,
+                                    momentum=config.momentum, weight_decay=cfg["wd"])
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, config.num_epochs, eta_min=0)
 
-    all_labels = torch.cat([labels, resampled_labels])
-    lda = LDA(n_classes=config.num_classes, lamb=1e-3)
-    lda.forward(all_features, all_labels)
-    # lda.forward(features, labels)
-
-    # lda = None
-    
-    validate(val_loader, model, classifier, lws_model, criterion, config, logger, block, lda=lda)
-    
-
-def validate(val_loader, model, classifier, lws_model, criterion, config, logger, block=None, lda=None):
-    batch_time = AverageMeter('Time', ':6.3f')
-    losses = AverageMeter('Loss', ':.3f')
-    top1 = AverageMeter('Acc@1', ':6.3f')
-    top5 = AverageMeter('Acc@5', ':6.3f')
-    progress = ProgressMeter(
-        len(val_loader),
-        [batch_time, losses, top1, top5],
-        prefix='Eval: ')
-
-    # switch to evaluate mode
-    model.eval()
-    if config.dataset == 'places':
-        block.eval()
-    classifier.eval()
-    class_num = torch.zeros(config.num_classes).cuda()
-    correct = torch.zeros(config.num_classes).cuda()
-
-    confidence = np.array([])
-    pred_class = np.array([])
-    true_class = np.array([])
-
-    with torch.no_grad():
-        end = time.time()
-        for i, (images, target) in enumerate(val_loader):
-            if config.gpu is not None:
-                images = images.cuda(config.gpu, non_blocking=True)
+    # end = time.time()
+    for epoch in range(config.num_epochs):
+        for i, (images, target) in enumerate(train_loader):
+            if i > end_steps:
+                break
             if torch.cuda.is_available():
+                images = images.cuda(config.gpu, non_blocking=True)
                 target = target.cuda(config.gpu, non_blocking=True)
+                output = model(images)
+                loss = criterion(output, target)
 
-            # compute output
-            # if config.dataset == 'places':
-            #     feat = block(model(images))
-            # else:
-            feat = model(images)
-            
-            if lda is not None:
-                output = lda.logit(feat)
-            else:
-                output = classifier(feat)
+                # compute gradient and do SGD step
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
 
-            lws_model.cuda() 
-            output.cuda()
-            output = lws_model(output)
-            loss = criterion(output, target)
+        train_acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        total_num += train_loader.batch_size 
+        total_loss += loss.item() * train_loader.batch_size 
 
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images.size(0))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
+        # val_loss, val_acc = validate(val_loader, model, criterion, config, block=None)
+        """
+        Validation code 
+        """
+        losses = AverageMeter('Loss', ':.3f')
+        top1 = AverageMeter('Acc@1', ':6.3f')
+        # top5 = AverageMeter('Acc@5', ':6.3f')
+        progress = ProgressMeter(
+            len(val_loader),
+            [losses, top1],
+            prefix='Eval: ')
 
-            _, predicted = output.max(1)
-            target_one_hot = F.one_hot(target, config.num_classes)
-            predict_one_hot = F.one_hot(predicted, config.num_classes)
-            class_num = class_num + target_one_hot.sum(dim=0).to(torch.float)
-            correct = correct + (target_one_hot + predict_one_hot == 2).sum(dim=0).to(torch.float)
+        # switch to evaluate mode
+        model.eval()
+        # classifier.eval()
+        total_loss, total_num = 0.0, 0
 
-            prob = torch.softmax(output, dim=1)
-            # prob = lda.predict_proba(feat)
-            confidence_part, pred_class_part = torch.max(prob, dim=1)
-            confidence = np.append(confidence, confidence_part.cpu().numpy())
-            pred_class = np.append(pred_class, pred_class_part.cpu().numpy())
-            true_class = np.append(true_class, target.cpu().numpy())
-
-            # measure elapsed time
-            batch_time.update(time.time() - end)
+        with torch.no_grad():
             end = time.time()
+            for i, (images, target) in enumerate(val_loader):
+                if config.gpu is not None:
+                    images = images.cuda(config.gpu, non_blocking=True)
+                if torch.cuda.is_available():
+                    target = target.cuda(config.gpu, non_blocking=True)
 
-            if i % config.print_freq == 0:
-                progress.display(i, logger)
+                # compute output
+                output = model(images)
+                loss = criterion(output, target)
 
-        acc_classes = correct / class_num
-        head_acc = acc_classes[config.head_class_idx[0]:config.head_class_idx[1]].mean() * 100
-        med_acc = acc_classes[config.med_class_idx[0]:config.med_class_idx[1]].mean() * 100
-        tail_acc = acc_classes[config.tail_class_idx[0]:config.tail_class_idx[1]].mean() * 100
+                total_num += val_loader.batch_size 
+                total_loss += loss.item() * val_loader.batch_size 
 
-        logger.info('* Acc@1 {top1.avg:.3f}% Acc@5 {top5.avg:.3f}% HAcc {head_acc:.3f}% MAcc {med_acc:.3f}% TAcc {tail_acc:.3f}%.'.format(top1=top1, top5=top5, head_acc=head_acc, med_acc=med_acc, tail_acc=tail_acc))
+                # measure accuracy and record loss
+                val_acc1, acc5 = accuracy(output, target, topk=(1, 5))
+                losses.update(loss.item(), images.size(0))
+                top1.update(val_acc1[0], images.size(0))
+                # top5.update(acc5[0], images.size(0))
 
-        cal = calibration(true_class, pred_class, confidence, num_bins=15)
-        logger.info('* ECE   {ece:.3f}%.'.format(ece=cal['expected_calibration_error'] * 100))
+            ret_loss = total_loss / total_num
 
-    return top1.avg, cal['expected_calibration_error'] * 100
+        """
+        Raytune logging
+        """
+        with tune.checkpoint_dir(epoch) as checkpoint_dir:
+            path = os.path.join(checkpoint_dir, "checkpoint")
+            torch.save((model.state_dict(), optimizer.state_dict()), path)
+
+        tune.report(loss=ret_loss, accuracy=top1.avg)    
+
+
+class RNClassifier(nn.Module):
+    def __init__(self, model, classifier) -> None:
+        super(RNClassifier, self).__init__()
+        self.model = model
+        self.classifier = classifier
+    
+    def forward(self, x):
+        return self.classifier(self.model(x))
 
 
 if __name__ == '__main__':
+    ray.init(num_gpus=1, num_cpus=16)
     main()

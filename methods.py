@@ -25,10 +25,15 @@ def mixup_data(x, y, alpha=1.0, use_cuda=True):
 
     return mixed_x, y_a, y_b, lam
 
-
+"""
+Reuglar mixup 
+"""
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1. - lam) * criterion(pred, y_b)
 
+"""
+Convex condition 1 
+"""
 # def mixup_criterion(criterion, pred, y_a, y_b, lam, x1, x2, pred_mixed, y_mixed):
 #     mixup = lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 #     # mixup = lam * criterion(x1, y_a) + (1 - lam) * criterion(x2, y_b)
@@ -43,7 +48,9 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 #     return mixup + hinge
 #     # return mixup2
 
-
+"""
+Convex condition 2
+"""
 # def mixup_criterion(criterion, pred, y_a, y_b, lam, pred_mixed, y_mixed, y, gamma=1.0, rho=0.0):
 #     loss_mixup = lam * criterion(pred, y_a) + (1.0 - lam) * criterion(pred, y_b) # lamda * L(f(x'),y1) + (1-lamda)* L(f(x'),y2)
 #     y_mixed = y_mixed.type(torch.LongTensor).cuda()
@@ -53,13 +60,13 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 #     # correct term: return sup + mixup
 #     return rho * sup + label_mixup + gamma * hinge
 
+"""
+Convex condition 3 Strong convex condition 1
+# """
+# def mixup_criterion(criterion, pred, y_a, y_b, lam, pred_mixed, y, x1, x2, gamma=0.9, rho=0.0, mu=0.5):
+#     # Mixup loss lamda * L(f(x'),y1) + (1-lamda)* L(f(x'),y2)
+#     mixup_loss = lam * criterion(pred, y_a) + (1. - lam) * criterion(pred, y_b)
 
-# def mixup_criterion(criterion, pred, y_a, y_b, lam, pred_mixed, y_mixed, y, x1, x2, gamma=0.9, rho=0.0, mu=0.5):
-#     # lamda * L(f(x'),y1) + (1-lamda)* L(f(x'),y2)
-#     y_a = y_a.type(torch.FloatTensor).cuda()
-#     y_b = y_b.type(torch.FloatTensor).cuda()
-#     y_mixed = y_mixed.type(torch.FloatTensor).cuda()
-#     loss_mixup = lam * criterion(pred, y_a) + (1.0 - lam) * criterion(pred, y_b) 
 #     # L(f(x'),y')
 #     label_mixup = criterion(pred_mixed, y_mixed)
 #     # L(f(x), y)
@@ -71,22 +78,23 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 
 #     return label_mixup + gamma*hinge
 
-# def mixup_criterion2(criterion, pred, y_a, y_b, lam, pred_mixed, y_mixed, y, x1, x2, gamma=0.9, rho=0.0, mu=0.5):
+"""
+Strong convex condition 2
+"""
+# def mixup_criterion(criterion, pred, y_a, y_b, lam, pred_mixed, y_mixed, y, gamma=0.01, rho=0.0, mu=0.1):
 #     # lamda * L(f(x'),y1) + (1-lamda)* L(f(x'),y2)
-#     y_a = y_a.type(torch.FloatTensor).cuda()
-#     y_b = y_b.type(torch.FloatTensor).cuda()
-#     y_mixed = y_mixed.type(torch.FloatTensor).cuda()
 #     y1_mixup = criterion(pred_mixed, y_a)
 #     y2_mixup = criterion(pred_mixed, y_b)
+
 #     # L(f(x'),y')
-#     label_mixup = criterion(pred_mixed, y_mixed)
-#     # L(f(x), y)
+#     mixup_loss = lam * y1_mixup + (1. - lam) * y2_mixup
 #     sup = criterion(pred, y) 
+
 #     # new term
-#     l2_dist = (y_mixed - y_a).pow(2).sum(dim=1).sqrt()
+#     l2_dist = (y_mixed - y_a).pow(2).sum().sqrt()
 #     dist = ((lam*(1.0-lam)*mu)/2) * l2_dist 
 
-#     hinge = max(0, (label_mixup - y1_mixup + (mu/2)*dist[0]))
+#     hinge = torch.max(torch.Tensor([0.0]).cuda().requires_grad_(True), (mixup_loss - y1_mixup + dist))
 #     return sup + gamma*hinge
     
 # class LabelAwareSmoothing(nn.Module):

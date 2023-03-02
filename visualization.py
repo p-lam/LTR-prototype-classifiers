@@ -8,6 +8,7 @@ import pandas as pd
 import torchvision.transforms as transforms 
 import matplotlib.pyplot as plt 
 import seaborn as sns 
+from sklearn.preprocessing import normalize, StandardScaler
 
 import torch
 import torch.nn as nn
@@ -220,44 +221,164 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
                           batch_size=config.batch_size, num_works=config.workers)
 
     train_loader = dataset.train_instance
+    balanced_loader = dataset.train_balance
+
     imgs, labels = [], []
     with torch.no_grad():
         for i, (images, target) in enumerate(train_loader):
             images = images.cuda()
             feats = model(images)
             # feats = images
-            # feats = classifier(feats)
+            feats = classifier(feats)
             imgs.append(feats.detach().cpu().numpy())
             labels.append(target.numpy())
     images = np.concatenate(imgs, axis=0)
     labels = np.concatenate(labels, axis=0)
+    labels = torch.from_numpy(labels)
+    images = torch.from_numpy(images)
+    X, y = images, labels
+
+    N, D = images.shape
+
+    imgs_b, labels_b = [], []
+    with torch.no_grad():
+        for i, (images, target) in enumerate(balanced_loader):
+            images = images.cuda()
+            feats = model(images)
+            # feats = images
+            feats = classifier(feats)
+            imgs_b.append(feats.detach().cpu().numpy())
+            labels_b.append(target.numpy())
+    images_b = np.concatenate(imgs_b, axis=0)
+    labels_b = np.concatenate(labels_b, axis=0)
+    labels_b = torch.from_numpy(labels_b)
+    images_b = torch.from_numpy(images_b)
+    X_b, y_b = images_b, labels_b
 
     labels, counts = torch.unique(labels, return_counts=True)
     # assert len(labels) == n_classes  # require X,y cover all classes
 
     # compute mean-centered observations and covariance matrix
-    N, D = images.shape
-    X_bar = images - torch.mean(images, 0)
+    X_bar = X - torch.mean(X, 0)
     St = X_bar.T.matmul(X_bar) / N  # total scatter matrix
-    Sw = torch.zeros((D, D), dtype=images.dtype, device=images.device, requires_grad=False)  # within-class scatter matrix
-    X, y = images, labels 
+    Sw = torch.zeros((D, D), dtype=X.dtype, device=X.device, requires_grad=True)  # within-class scatter matrix
+    
     means = []
     for i in range(config.num_classes):
         Xg = X[y == i]
         means.append(torch.mean(Xg, dim=0))
     Xg_mean = torch.stack(means, dim=0)       
 
+    """
+    Plotting population variance
+    """
+    # var_list = []
+    # for i in range(config.num_classes):
+    #     Xg = X[y == i]
+    #     Xg = Xg.detach().cpu().numpy()
+    #     cov_matrix = np.cov(Xg, bias=True)
+    #     # covs = np.linalg.norm(cov_matrix, 'fro')
+    #     vars = cov_matrix.diagonal()
+    #     norm = np.linalg.norm(vars, 1)
+    #     var_list.append(norm)
+
+    # var_list_b = []
+    # for i in range(config.num_classes):
+    #     Xg = X_b[y_b == i]
+    #     Xg = Xg.detach().cpu().numpy()
+    #     cov_matrix = np.cov(Xg, bias=True)
+    #     # covs = np.linalg.norm(cov_matrix, 'fro')
+    #     vars = cov_matrix.diagonal()
+    #     norm = np.linalg.norm(vars,1)
+    #     var_list_b.append(norm)
+    
+    # sns.set_style("darkgrid")
+    # df = pd.DataFrame({'D_LT Variance': var_list, 'D_Bal Variance': var_list_b})
+    # # df["Instance count"] = counts
+    # sns.lineplot(x=df.index, y='D_Bal Variance', data=df, color=sns.color_palette()[0], label="D_Bal Variance")
+    # sns.lineplot(x=df.index, y='D_LT Variance', data=df, color=sns.color_palette()[1], label="D_LT Variance")
+    # imb_factor = int(counts[0] / counts[-1])
+    # dataset_name = 'CIFAR-100' if config.dataset == 'cifar100' else 'CIFAR-10'
+    # plt.title(f"Variance in {dataset_name} classes (IF={imb_factor})")
+    # plt.legend()
+    # plt.xlabel('Class index')
+    # plt.ylabel('L1 Norm of Variance')
+    # plt.show()
+    
+    
+    """
+    Plotting proportion of variance explained by first principal component
+    """
+    # exp_var = []
+    # for i in range(config.num_classes):
+    #     Xg = X[y == i]
+    #     Xg = Xg.detach().cpu().numpy()
+    #     pca = PCA(n_components=5)
+    #     pca.fit(Xg)
+    #     exp_var.append(pca.explained_variance_ratio_[0])
+    
+    # exp_var_b = []
+    # for i in range(config.num_classes):
+    #     Xg = X_b[y_b == i]
+    #     Xg = Xg.detach().cpu().numpy()
+    #     pca2 = PCA(n_components=5)
+    #     pca2.fit(Xg)
+    #     exp_var_b.append(pca2.explained_variance_ratio_[0])
+
+    # sns.set_style("darkgrid")
+    # df = pd.DataFrame({'D_LT': exp_var, 'D_Bal': exp_var_b})
+    # # df["Instance count"] = counts
+    # sns.lineplot(x=df.index, y='D_Bal', data=df, color=sns.color_palette()[0], label="D_Bal")
+    # sns.lineplot(x=df.index, y='D_LT', data=df, color=sns.color_palette()[1], label="D_LT")
+    # imb_factor = int(counts[0] / counts[-1])
+    # dataset_name = 'CIFAR-100' if config.dataset == 'cifar100' else 'CIFAR-10'
+    # plt.title(f"% of Variance Explained in {dataset_name} classes (IF={imb_factor})")
+    # plt.legend()
+    # plt.xlabel('Class index')
+    # plt.ylabel('% of variance explained')
+    # plt.show()
+
+    """
+    Plotting Sw
+    """
+    intra_class_vars = [] 
     for c, Nc in zip(labels, counts):
         # Xg = X[y == c]
         # Xg_mean[int(c), :] = torch.mean(Xg, 0)
         # Xg_bar = Xg - Xg_mean[int(c), :]
         Xg = X[y == c]                                                                  # [None, d]
-        Xg_bar = Xg - torch.mean(Xg, dim=0, keepdim=True)                               # [None, d]
-        Sw = Sw + (Xg_bar.T.matmul(Xg_bar) / Nc)
-    Sw /= config.num_classes
-    Sw = Sw.detach().cpu().numpy()
-    sns.lineplot(Sw)
-    
+        # Xg_bar = Xg - torch.mean(Xg, dim=0, keepdim=True)                               # [None, d]
+        Xg_bar = Xg - torch.mean(Xg)                               # [None, d]
+        
+        Sw = (Xg_bar.T.matmul(Xg_bar) / Nc)
+        Sw /= Nc
+        evals, evecs = torch.eig(Sw, eigenvectors=True)
+        noncomplex_idx = evals[:, 1] == 0
+        evals = evals[:, 0][noncomplex_idx] # take real part of eigen values
+        evecs = evecs[:, noncomplex_idx]
+        evals, inc_idx = torch.sort(evals) # sort by eigen values, in ascending order
+        evecs = evecs[:, inc_idx]
+        # evals, evecs = torch.linalg.eig(Sw)
+        # evals = torch.view_as_real(evals)
+        # evals = [i[0] for i in evals]
+        intra_class_var = max(evals)
+        intra_class_var = intra_class_var.detach().cpu().numpy()
+        intra_class_vars.append(intra_class_var)
+
+    sns.set_style("darkgrid")
+    df = pd.DataFrame({'Variance':intra_class_vars}).astype(float)
+    df["Instance count"] = counts
+    fig, ax = plt.subplots()
+    ax2 = ax.twinx()
+    sns.lineplot(x=df.index, y='Instance count', data=df, ax=ax, color=sns.color_palette()[0])
+    sns.lineplot(x=df.index, y='Variance', data=df, ax=ax2, color=sns.color_palette()[1], linestyle='--')
+    imb_factor = int(counts[0] / counts[-1])
+    dataset_name = 'CIFAR-100' if config.dataset == 'cifar100' else 'CIFAR-10'
+    plt.title(f"Intra-class variances of {dataset_name} classes (IF={imb_factor})")
+    ax.figure.legend()
+    ax.set_xlabel('Class index')
+    plt.show()
+
     # filtered = [] 
     # cnt1, cnt2, cnt3 = 0, 0, 0 
     # for i, j in zip(images, labels):
@@ -308,7 +429,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
     y_tsne = tsne[:,1]
     # x_tsne = scale_to_01_range(x_tsne)
     # y_tsne = scale_to_01_range(y_tsne) 
-
+    
     fig = plt.figure()
     ax = fig.add_subplot(111)
 
@@ -317,9 +438,11 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
             indices = [i for i, l in enumerate(labels) if l == label]
             current_tx = np.take(x_tsne, indices)
             current_ty = np.take(y_tsne, indices)
-            ax.scatter(current_tx, current_ty, label=label)
-    ax.legend(loc='best')
-    plt.show() 
+            plt.scatter(current_tx, current_ty, label=label)
+            plt.show()
+            # ax.scatter(current_tx, current_ty, label=label)
+    # ax.legend(loc='best')
+    # plt.show() 
 
     # print(x_tsne.shape, y_tsne.shape)
     # plt.figure(figsize=(16,16))
@@ -329,10 +452,10 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
     # plt.plot()
     # plt.show()
 
-def scale_to_01_range(x):
-    value_range = (np.max(x) - np.min(x))
-    starts_from_zero = x - np.min(x)
-    return starts_from_zero / value_range
+# def scale_to_01_range(x):
+#     value_range = (np.max(x) - np.min(x))
+#     starts_from_zero = x - np.min(x)
+#     return starts_from_zero / value_range
 
 
 if __name__ == '__main__':

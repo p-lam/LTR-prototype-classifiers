@@ -40,10 +40,10 @@ smooth_head: 0.4
 smooth_tail: 0.1
 shift_bn: True
 lr_factor: 0.2
-lr: 0.1
-batch_size: 128
+lr: 0.01
+batch_size: 64
 weight_decay: 2e-4
-num_epochs: 10
+num_epochs: 1
 momentum: 0.9
 mixup: False
 alpha: null
