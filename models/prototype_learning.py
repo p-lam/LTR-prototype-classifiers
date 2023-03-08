@@ -24,7 +24,7 @@ class LearnedPrototypes(nn.Module):
         prototypes=None,
         squared=False,
         ph=None,
-        dist="CDT",
+        dist="euclidean",
         device="cuda",
     ):
 

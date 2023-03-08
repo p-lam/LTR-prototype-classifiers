@@ -7,7 +7,6 @@ import warnings
 import numpy as np
 import pprint
 import math
-import matplotlib.pyplot as plt 
 
 import torch
 import torch.nn as nn
@@ -28,6 +27,7 @@ from datasets.ina2018 import iNa2018
 from models import resnet
 from models import resnet_places
 from models import resnet_cifar
+from models.network_arch_resnet import *
 
 from utils import config, update_config, create_logger
 from utils import AverageMeter, ProgressMeter
@@ -118,13 +118,14 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
                                 world_size=config.world_size, rank=config.rank)
 
     if config.dataset == 'cifar10' or config.dataset == 'cifar100':
-        model = getattr(resnet_cifar, config.backbone)()
-        classifier = getattr(resnet_cifar, 'Classifier')(feat_in=64, num_classes=config.num_classes)
-
+        # model = getattr(resnet_cifar, config.backbone)()
+        # classifier = getattr(resnet_cifar, 'Classifier')(feat_in=64, num_classes=config.num_classes)
+        model = ResnetEncoder(num_layers=34, isPretrained=False, embDimension=config.num_classes, poolSize=4)
+        classifier = Classifier(feat_in=512, num_classes=config.num_classes)
+    # TODO implement imagenet + inat + places
     elif config.dataset == 'imagenet' or config.dataset == 'ina2018':
         model = getattr(resnet, config.backbone)()
         classifier = getattr(resnet, 'Classifier')(feat_in=2048, num_classes=config.num_classes)
-
     elif config.dataset == 'places':
         model = getattr(resnet_places, config.backbone)(pretrained=True)
         classifier = getattr(resnet_places, 'Classifier')(feat_in=2048, num_classes=config.num_classes)
@@ -195,11 +196,11 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
                 loc = 'cuda:{}'.format(config.gpu)
                 checkpoint = torch.load(config.resume, map_location=loc)
             # config.start_epoch = checkpoint['epoch']
-            best_acc1 = checkpoint['best_acc1']
-            its_ece = checkpoint['its_ece']
-            if config.gpu is not None:
-                # best_acc1 may be from a checkpoint from a different GPU
-                best_acc1 = best_acc1.to(config.gpu)
+            # best_acc1 = checkpoint['best_acc1']
+            # its_ece = checkpoint['its_ece']
+            # if config.gpu is not None:
+            #     # best_acc1 may be from a checkpoint from a different GPU
+            #     best_acc1 = best_acc1.to(config.gpu)
             model.load_state_dict(checkpoint['state_dict_model'])
             classifier.load_state_dict(checkpoint['state_dict_classifier'])
             if config.dataset == 'places':
@@ -280,7 +281,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
     logit_adjustments = logadj.compute_adjustment(train_loader, tro_train) 
 
     # 1-stage training
-    proto_lr = 4 # paper lr 4
+    proto_lr = 0.01
     optimizer = torch.optim.SGD(proto_model.parameters(),
                             proto_lr,
                             momentum=config.momentum)
@@ -294,8 +295,7 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
         if config.dataset != 'places':
             block = None
         # train for one epoch
-    
-        acc1, ece, prototypes = train(train_loader, val_loader, proto_model, logit_adjustments, lws_model, criterion, optimizer, epoch, config, logger, block)
+        acc1, ece = train(train_loader, val_loader, proto_model, logit_adjustments, lws_model, criterion, optimizer, epoch, config, logger, block)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -341,11 +341,12 @@ def train(train_loader, val_loader, proto_model, logit_adjustments, lws_model, c
     end_steps = int(training_data_num / train_loader.batch_size)
    
     # temp = torch.rand(size=(64,64), device="cuda").requires_grad_(True)
-    temp = torch.eye(64, device="cuda").requires_grad_(True)
-    temp_lr = 5e-3 # paper 5e-3
+    temp = torch.eye(512, device="cuda").requires_grad_(True)
+    temp_lr = 0.5
     optimizer_temp = torch.optim.SGD([temp],
                                     temp_lr,
-                                    momentum=config.momentum)                     
+                                    momentum=config.momentum,
+                                    weight_decay=2e-4)                                
     adjust_learning_rate(optimizer_temp, epoch, temp_lr, config)
 
     for i, (images, target) in enumerate(train_loader):
@@ -356,8 +357,7 @@ def train(train_loader, val_loader, proto_model, logit_adjustments, lws_model, c
             images = images.cuda(config.gpu, non_blocking=True)
             target = target.cuda(config.gpu, non_blocking=True)
             output = proto_model(images, temp) 
-            # output = output + logit_adjustments
-            output = output
+            output = output + logit_adjustments
             loss = criterion(output, target) 
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -377,7 +377,7 @@ def train(train_loader, val_loader, proto_model, logit_adjustments, lws_model, c
 
     # evaluate on test set
     acc1, ece = validate(val_loader, proto_model, logit_adjustments, temp, lws_model, criterion, config, logger, block)
-    return acc1, ece, proto_model.prototypes
+    return acc1, ece 
 
 
 def validate(val_loader, proto_model, logit_adjustments, temp, lws_model, criterion, config, logger, block=None):

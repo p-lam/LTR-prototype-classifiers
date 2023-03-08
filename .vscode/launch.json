@@ -12,7 +12,9 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "args": ["--cfg", "./config/cifar100/cifar100_imb001_stage2_mislas.yaml","name", "test", "resume", "saved/cifar100_2e-4/ckps/current.pth.tar"]
+            "args": ["--cfg", "./config/cifar100/cifar100_imb001_stage2_mislas.yaml","name", "test", "resume", "saved/cifar100_2e-4/ckps/current.pth.tar", "batch_size", "500"]
         }
     ]
 }
+
+// python3 train_stage1.py --cfg ./config/cifar100/cifar100_imb001_stage1_mixup.yaml name rn34 batch_size 64 weight_decay 5e-3 cos True mixup False lr 0.01 num_epochs 320

@@ -35,19 +35,10 @@ from models import vgg
 from utils import config, update_config, create_logger
 from utils import AverageMeter, ProgressMeter
 from utils import accuracy, calibration
-from lda import LDA
-from vos import vos_sampling_step
 
 from methods import mixup_data, mixup_criterion
 from sklearn.mixture import GaussianMixture 
 from sklearn.model_selection import GridSearchCV
-
-
-param_grid = {
-    "n_components": 30,
-    "covariance_type": ["tied"], # "spherical", "tied", "diag", "full"
-    "random_state": 0
-}
 
 
 def gmm_bic_score(estimator, X):
