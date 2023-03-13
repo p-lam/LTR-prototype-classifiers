@@ -270,17 +270,17 @@ def main_worker(gpu, ngpus_per_node, config, logger, model_dir):
     prototypes = prototypes.T
 
     # model init 
-    def create_model(model, classifier, prototypes):
-        proto = LearnedPrototypes(model, classifier, n_prototypes=config.num_classes, prototypes=prototypes, device="cuda")
+    def create_model(model, prototypes):
+        proto = LearnedPrototypes(model, n_prototypes=config.num_classes, prototypes=prototypes, device="cuda", dist="CDT")
         return proto.cuda()
 
-    proto_model = create_model(model, classifier, prototypes)
+    proto_model = create_model(model, prototypes)
     
     tro_train = 1/4
     logit_adjustments = logadj.compute_adjustment(train_loader, tro_train) 
 
     # 1-stage training
-    proto_lr = 4 # paper lr 4
+    proto_lr = 4 # paper lr 4  
     optimizer = torch.optim.SGD(proto_model.parameters(),
                             proto_lr,
                             momentum=config.momentum)
@@ -336,7 +336,10 @@ def train(train_loader, val_loader, proto_model, logit_adjustments, lws_model, c
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
-    proto_model.train()
+    for param in proto_model.model.parameters():
+        param.requires_grad = False
+    proto_model.prototypes.requires_grad_(True)
+   
     training_data_num = len(train_loader.dataset)
     end_steps = int(training_data_num / train_loader.batch_size)
    
@@ -356,8 +359,7 @@ def train(train_loader, val_loader, proto_model, logit_adjustments, lws_model, c
             images = images.cuda(config.gpu, non_blocking=True)
             target = target.cuda(config.gpu, non_blocking=True)
             output = proto_model(images, temp) 
-            # output = output + logit_adjustments
-            output = output
+            output = output + logit_adjustments
             loss = criterion(output, target) 
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -391,7 +393,9 @@ def validate(val_loader, proto_model, logit_adjustments, temp, lws_model, criter
         prefix='Eval: ')
 
     # switch to evaluate mode
-    proto_model.eval()
+    for param in proto_model.model.parameters():
+        param.requires_grad = False
+    proto_model.prototypes.requires_grad_(False)
     class_num = torch.zeros(config.num_classes).cuda()
     correct = torch.zeros(config.num_classes).cuda()
 
